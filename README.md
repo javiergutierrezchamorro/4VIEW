@@ -1,4 +1,4 @@
-# 4View 1.00
+# 4View 1.10
 
 **Turbo Vision style text file viewer for DOS**
 
@@ -35,12 +35,22 @@ Classic Turbo Vision look:
 - DOS 2.0+ / FreeDOS / DOSBox
 - 80×25 text mode
 - Optional mouse driver (CuteMouse recommended for wheel)
+- [SMART.INC](https://github.com/javiergutierrezchamorro/SMART.INC) macros (only to assemble, not to run)
 
 ## Building with ASMC
 
 ```
-ASMC 4VIEW.ASM
+ASMC -bin -Fo 4VIEW.COM 4VIEW.ASM
 ```
+
+For 386+ machines there is a dedicated build with 32-bit string ops and
+immediate shifts (the title and About box then say **4VIEW386**):
+
+```
+ASMC -3 -bin -Fo 4VIEW386.COM 4VIEW.ASM
+```
+
+`SMART.INC` from [its repository](https://github.com/javiergutierrezchamorro/SMART.INC) must be next to `4VIEW.ASM` or on the include path.
 
 (The supplied `4VIEW.COM` is a pre-built binary with identical functionality.)
 
@@ -60,6 +70,8 @@ TYPE filename.txt | 4VIEW
 | Page up / down      | PgUp / PgDn              |
 | Start / End         | Home / End               |
 | Jump                | Click on scrollbar       |
+| Horizontal scroll   | ← / →  (Ctrl = 10 cols)  |
+| Help / About        | F1 / F10                 |
 | Quit                | ESC                      |
 
 ## Author
@@ -73,3 +85,5 @@ Free to use, modify and distribute. Attribution appreciated.
 ## Version
 
 **1.00** – Initial release with mouse wheel, line cache, exact counters and Turbo Vision UI.
+
+**1.10** – Performance and polish revision: buffered file engine with soft seeks, view cache and line-start ring (scrolling and horizontal repaints do near-zero file I/O), unrolled line scanners, length-byte slots (h-scroll without re-walks), 4VIEW386 build name, blinking load indicator. Assembles with ASMC and uses SMART.INC.

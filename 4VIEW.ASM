@@ -1,13 +1,15 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 1.08 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 1.10 - Turbo Vision style text viewer for DOS (ASMC)
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
-; Reviewed & optimized revision 1.08 (4-byte count scan + 2-byte
-; store scan + unrolled paint, on top of the 1.07 word-scan + ring +
-; first-view capture work)
+; Reviewed & optimized revision 1.10 (slot length bytes: the hPos
+; walk is gone, h-scroll hit paints pure; count scanner unrolled to
+; 8 bytes; 4VIEW386 build name; on top of the 1.09 view cache +
+; line-start ring work)
 ;
 ; Assemble with ASMC (flat COM, single segment):
 ;     ASMC -bin -Fo 4VIEW.COM 4VIEW.ASM          (8088/8086, default)
-; 386+ build (immediate shifts + 32-bit string ops; About shows "386+"):
+; 386+ build (immediate shifts + 32-bit string ops; the title bar and
+; About say "4VIEW386", fix 68):
 ;     ASMC -3 -bin -Fo 4VIEW386.COM 4VIEW.ASM
 ; (with JWasm the equivalents are: JWASM -bin -Fo=4VIEW.COM 4VIEW.ASM and
 ;  JWASM -3 -bin -Fo=4VIEW386.COM 4VIEW.ASM; SMART.INC must be next to
@@ -264,6 +266,85 @@
 ;     2*CX(+1) expression. Full repaint of a 77x23 window: ~2.7 ms
 ;     less on the paint side alone @ 12.5 MHz.
 ; 62. Version 1.08.
+;
+; Revision 1.09 fixes:
+; 63. VIEW CACHE (vCache): DrwCnt parses every row straight into a
+;     23x256 cache (line j lives in slot j mod 23, the ring's own
+;     discipline) instead of lBuf - the parse is the copy. wDest in
+;     RdLine selects the store target (STOSB follows DI, so slot
+;     indirection costs nothing); a hit (curLine == vcTop) repaints
+;     the slots through RingPaint with paintBuf=vCache: Left/Right
+;     h-scroll and popup close now do ZERO reads, seeks and parses
+;     (1.08: 23 parses + 77-skip walk per row). RingPaint is
+;     parameterized on paintBuf; wDest/paintBuf are pointers and are
+;     deliberately outside the Init-cleared block.
+; 64. LINE-START RING (vPos, 32 entries, line j -> entry j and 31)
+;     recorded by every cache fill: DrwDn1 with a valid cache
+;     (vcTop == curLine-1) reads the new bottom line's start from
+;     vPos and parses ONE line into the slot the old top just left
+;     (mod 23 they are the same slot) - a Down cost 23 parses in
+;     1.08, it costs 1 now; the entry below the view is re-recorded
+;     so Down chains stay hot. DrwUp1's hot path (vcTop == curLine+1)
+;     parses the new top into the slot the old bottom left (vSlot
+;     tracks line mod 23) and DrwUp1 records the new top's vPos
+;     entry, so Up/Down zig-zags never go cold either. 24-25 live
+;     entries < 32, so vPos entries never alias mid-chain. The entry
+;     cursor rides BX/SI/DI (whichever each path has free): DX cannot
+;     index memory on the 8086.
+; 65. Version 1.09.
+;
+; Revision 1.10 fixes:
+; 66. SLOT LENGTH BYTES: a 256-byte slot (lBuf, ring, vCache) now
+;     holds LBUFCAP=254 chars + the NUL + the line's length at
+;     slot+255, written once by RdLine at its single exit (a word
+;     SUB + a byte store per line) and carried by RingAppend into
+;     the ring. WrCntRow reads it and jumps straight to the window
+;     start with one ADD (slot+hPos) or pads the whole row when the
+;     line ends left of the window: the 1.08 LODSW skip walk, its
+;     odd-column case and its NUL-backtrack (@@sl/@@sh) are deleted,
+;     no paint can ever read stale slot bytes, and HPOSMAX drops to
+;     177 (one column less of scroll range, invisible past the text).
+;     hPos=77 on a cache hit: ~41K cycles less per repaint.
+; 67. COUNT SCANNER UNROLLED TO EIGHT BYTES: four LODSW pairs per
+;     iteration amortize LOOP over 8 bytes (~22.1 vs ~24.25 cycles/
+;     byte, -9%): the 385 KB pre-scan drops ~65 ms @ 12.5 MHz. The
+;     shared @@candlo/@@candhi handlers serve all eight halves; the
+;     byte tail now covers 0..7 residues.
+; 68. BUILD NAME: every user-visible string (title bar, About) says
+;     4VIEW386 on the -3 build and 4VIEW on the 8086 build.
+; 69. Version 1.10.
+; 70. LOADING DOTS BLINK: the "..." of the "Loading <file>..." status
+;     bar is repainted with the blink bit (attribute or 80h) set right
+;     after PaintStat, so the load state is visible on slow machines.
+;     Init also force-enables the BIOS blink state (INT 10h AX=1103h
+;     BX=0001h, a no-op on PC/XT BIOSes): with blink disabled by an
+;     earlier program, bit 7 renders as a bright background instead
+;     of flashing and the marker would not blink at all.
+; 71. VIDEO MODE RESTORED ON EXIT: Init forces mode 3 for every mode
+;     that is not 2/3/7 (the 40-column modes 0/1 corrupted the 80x25
+;     layout as well), remembers the user's mode, and Done sets it
+;     back. Before, running 4VIEW from any non-text mode left the
+;     session stuck in mode 3 after exit. The forced path skips the
+;     saved-screen restore: the mode set at entry already cleared the
+;     original page, there is nothing left to put back.
+; 72. HLL PASS ON THE COLD LOOPS: DrwFrm/DrwBar paint loops use
+;     .REPEAT/.UNTILCXZ, the pop-up save/restore row loops
+;     .REPEAT/.UNTILZ, and PopLine pads its tail with one REP STOSW -
+;     identical or better code, all of it outside the hot paths. The
+;     hand-written flow of the hot text loops (WrTxt, WrCntRow, RdLine
+;     scanners) stays on purpose.
+; 73. SMART.INC V2.3 LEVERAGE PASS: the remaining constant-count shifts
+;     written as 1-bit chains use the count form (shl ax,2 in the vPos
+;     index math, shr cx,3 in the count scanner's /8, shr cx,2 in
+;     CpyN's 386 path): byte-identical code on 8086 and ONE native
+;     instruction on the -3 build. vSlot's zero-extension uses movzx
+;     (mov al,x/xor ah,ah on 8086, native on 386), and ReadKey/PopUp
+;     use the multi-operand push/pop. Nothing else in v2.3 applies:
+;     FastIMul targets signed 16-bit constant multiplies (4VIEW's are
+;     32-bit, already FastMul 22/100), setfield/getfield need packed
+;     bit fields (4VIEW has none) and clrflag/flipflag/maskflag need
+;     single-bit state (4VIEW's flags are whole bytes, better served
+;     by mov).
 ;------------------------------------------------------------------------------
 option dotname
 .model tiny
@@ -276,9 +357,9 @@ option dotname
 ;------------------------------------------------------------------------------
 USE386  equ (@Cpu AND 1000b)
 
-include smart.inc               ; shl/shr imm, FastMul, push/pop multi,
-                                ; setflag/testflag (Guti, v2.0). Include
-                                ; AFTER the CPU is selected: @Cpu is read
+include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
+                                ; multi, setflag/testflag (Guti, v2.3).
+                                ; Include AFTER the CPU is selected: @Cpu is read
                                 ; here (8086: shifts expand 1 bit at a
                                 ; time, MOVZX/MOVSX are emulated; -3: the
                                 ; native forms pass straight through).
@@ -286,16 +367,23 @@ include smart.inc               ; shl/shr imm, FastMul, push/pop multi,
 .code
 org 100h
 
-VERMAJ      equ 1                       ; product version 1.08
-VMIN        equ 8
+VERMAJ      equ 1                       ; product version 1.10
+VMIN        equ 10
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
 CACHE_SZ    equ 48                      ; status row 24)
 BUFSZ       equ 16384                   ; 16 KiB: 24 reads per 385 KB (fix 42)
 LINEWID     equ 77                      ; painted columns of a line
-LBUFCAP     equ 255                     ; chars kept per line (lBuf/SLOTSZ-1)
+LBUFCAP     equ 254                     ; chars kept per line: the 256-byte
+                                        ; slot is chars + NUL + the line's
+                                        ; length byte at 255 (fix 66)
 HPOSMAX     equ LBUFCAP-LINEWID         ; last useful horizontal window
+                                        ; (177 < 256: WrCntRow compares
+                                        ; hPos's low byte, fix 66)
 RINGN       equ LINES_VIS               ; ring: the visible window
-SLOTSZ      equ LBUFCAP+1               ; ring slot bytes (chars + NUL)
+SLOTSZ      equ 256                     ; slot bytes: LBUFCAP chars + NUL
+                                        ; + length byte; 256 keeps the
+                                        ; AH-trick slot addressing alive
+VPOSN       equ 32                      ; vPos entries (line j -> j and 31)
 ATTR_CONT   equ 1Fh
 ATTR_HDR    equ 30h
 ATTR_STAT   equ 30h
@@ -475,15 +563,27 @@ Init proc
         mov ax,0040h
         mov es,ax
         mov bl,es:[49h]
-        .if (bl>3 && bl!=7)
-                mov ax,0003h            ; force 80x25 color text
-                int 10h
-                mov bl,3
+        mov svMode,bl                  ; the mode at entry (fix 71)
+        .if (bl!=2 && bl!=3 && bl!=7)  ; not an 80x25 text mode: modes 0/1
+                mov ax,0003h           ; are 40-column (the 80x25 layout
+                int 10h                ; corrupted them too, fix 71), 4+
+                mov bl,3               ; are graphics. Force mode 3 and
+                mov svForced,1         ; remember it for Done (fix 71)
         .endif
         .if (bl==7)
                 mov word ptr vSeg,0B000h
         .endif
         pop es
+        ; blink ON (fix 70): the loading "..." carries attribute bit 7,
+        ; which only blinks while the BIOS blink state is enabled - a
+        ; previous program may have switched to "bright backgrounds"
+        ; (INT 10h AX=1003h/BL=0), which turns B0h into a steady bright
+        ; cyan. AX=1103h BX=0001h re-enables it on EGA/VGA; the PC/XT
+        ; BIOSes range-check AH and IRET on 10h+, so it is a no-op on
+        ; CGA/MDA machines (where nothing could have disabled it).
+        mov ax,1103h
+        mov bx,0001h
+        int 10h
 
         ; save cursor (shape, position, page) and the whole text screen
         ; BEFORE anything is painted, so Done can put it all back (fix 22)
@@ -557,8 +657,7 @@ Init endp
 CpyN proc
         if USE386
         push cx
-        shr cx,1
-        shr cx,1
+        shr cx,2
         movzx ecx,cx            ; REP reads ECX: no stale high word (36)
         rep movsd
         pop cx
@@ -616,7 +715,9 @@ FullPath endp
 
 ;------------------------------------------------------------------------------
 ; StatLoad - status bar: "Loading <SI>..." while the file is loaded.
-; DS:SI = ASCIZ middle string (fName or sSTDIN).
+; DS:SI = ASCIZ middle string (fName or sSTDIN). The trailing "..."
+; is repainted with the blink bit set (fix 70): the pre-scan of a big
+; file can take seconds, and a blinking marker says "busy, not hung".
 ;------------------------------------------------------------------------------
 StatLoad proc
         push ds
@@ -627,10 +728,24 @@ StatLoad proc
         call Cpy
         pop si
         call Cpy
+        mov ax,di                       ; AX = offset of "..." in stBuf
+        push ax                         ; (fix 70)
         mov si,offset sDots
         call Cpy
         mov byte ptr [di],0
         call PaintStat
+        pop ax                          ; repaint the dots with the blink
+        mov si,ax                       ; bit: PaintStat wrote them with
+        add si,offset stBuf            ; the plain status color
+        shl ax,1                       ; char offset -> page byte offset
+        mov es,vSeg
+        mov di,24*160+2
+        add di,ax
+        mov ah,ATTR_STAT or 80h        ; blink attribute (bit 7)
+        .while (byte ptr [si])
+                lodsb
+                stosw
+        .endw
         ret
 StatLoad endp
 
@@ -761,6 +876,8 @@ RingAppend proc uses cx
         xor al,al                       ; AX = rIdx*256 without shl ax,8
         mov di,offset rBuf
         add di,ax
+        mov al,byte ptr lBuf[255]       ; the length byte travels with
+        mov byte ptr [di+255],al        ; the line into the ring (fix 66)
         mov si,offset lBuf
 @@c:    lodsb
         stosb
@@ -774,12 +891,14 @@ RingAppend proc uses cx
 RingAppend endp
 
 ;------------------------------------------------------------------------------
-; RingPaint - paint the ring as the content window (fix 56, split out of
-; DrwCnt): row i shows line curLine+i, which lives in slot (curLine+i)
-; mod RINGN (line j is slot j mod RINGN by construction); the walk starts
-; at slot curLine mod RINGN and wraps once. Callers: DrwCnt for STDIN and
-; for the captured first view (ringView, curLine==0 - the initial Draw
-; and Home do no file I/O at all, fix 55).
+; RingPaint - paint a 23-slot buffer as the content window (fix 56, split
+; out of DrwCnt): row i shows line curLine+i, which lives in slot
+; (curLine+i) mod RINGN (line j is slot j mod RINGN by construction);
+; the walk starts at slot curLine mod RINGN and wraps once. The buffer
+; base comes from paintBuf (fix 63): rBuf for STDIN and the captured
+; first view (ringView, curLine==0 - the initial Draw and Home do no
+; file I/O at all, fix 55), vCache for h-scroll/pop-up repaints of an
+; already-parsed view (fix 63).
 ;------------------------------------------------------------------------------
 RingPaint proc uses ax bx cx dx si di bp
         mov es,vSeg
@@ -790,7 +909,7 @@ RingPaint proc uses ax bx cx dx si di bp
         mov ax,dx
         mov ah,al
         xor al,al                       ; AX = slot*256 (no shl ax,8)
-        mov si,offset rBuf
+        mov si,paintBuf
         add si,ax
         mov di,160+2
         mov cx,LINES_VIS
@@ -801,9 +920,11 @@ RingPaint proc uses ax bx cx dx si di bp
                 call WrCntRow
                 pop si
                 add si,SLOTSZ
-                cmp si,offset rBuf+RINGN*SLOTSZ
+                mov ax,paintBuf
+                add ax,RINGN*SLOTSZ
+                cmp si,ax
                 jb @@k
-                mov si,offset rBuf      ; wrap to the oldest slot
+                mov si,paintBuf         ; wrap to the oldest slot
 @@k:            mov di,bp
                 add di,160
                 pop cx
@@ -1041,8 +1162,7 @@ MousePoll endp
 ; it is taken immediately, without an idle call. Used by the pop-ups.
 ;------------------------------------------------------------------------------
 ReadKey proc
-        push ds
-        push bx
+        push ds, bx                     ; SMART.INC multi push
         mov ax,0040h
         mov ds,ax
         .while (1)
@@ -1057,8 +1177,7 @@ ReadKey proc
         jb @F
         mov bx,001Eh                    ; wrap around to the ring start
 @@:     mov ds:[001Ah],bx               ; advance the head
-        pop bx
-        pop ds
+        pop bx, ds                     ; SMART.INC multi pop
         ret
 ReadKey endp
 
@@ -1152,7 +1271,7 @@ ScrUp proc
 @@moved:
         dec curLine                     ; rescan lands exactly one line up:
                                         ; the last cached entry IS line A-1
-@@cl:   ; curPos = last cached line start (the new current line)
+        ; curPos = last cached line start (the new current line)
         mov bx,cCnt
         dec bx
         shl bx,2
@@ -1216,7 +1335,12 @@ ScrDn endp
 ; down one row with one REP (backward, overlap-safe) and draw only the
 ; new top row. The new top line text is re-read from curPos (cheap:
 ; buffered, and the restore goes through SeekSoft, fix 48). 32-bit
-; REP MOVSD on the -3 build (fix 36).
+; REP MOVSD on the -3 build (fix 36). With a valid view cache
+; (vcTop == curLine+1, fix 64) the line is parsed into the slot the
+; old bottom line just left and the cache slides up one; otherwise
+; the cache is invalidated and the line goes to lBuf as before.
+; vPos always gets the new top line's start, so a Down right after
+; an Up is still hot.
 ;------------------------------------------------------------------------------
 DrwUp1 proc
         push es
@@ -1238,18 +1362,46 @@ DrwUp1 proc
         endif
         cld
         pop ds
-        ; fetch the new top line: RdLine advances curPos, so save/restore it
+        ; fetch the new top line: RdLine advances curPos, so save it
         mov ax,word ptr curPos
         mov word ptr savPos,ax
         mov ax,word ptr curPos+2
         mov word ptr savPos+2,ax
-        call RdLine
+        mov bx,curLine
+        and bx,31
+        shl bx,2                       ; BX = (curLine and 31)*4: vPos
+        mov ax,word ptr curPos          ; entry (DX is not indexable on
+        mov word ptr vPos[bx],ax        ; 8086, fix 64)
+        mov ax,word ptr curPos+2
+        mov word ptr vPos[bx+2],ax
+        .if (vcValid && vcTop==curLine+1)
+                ; hot (fix 64): the new top line takes the slot the old
+                ; bottom line (vcTop+22, slots are line mod 23) just left
+                .if (vSlot)
+                        dec vSlot
+                .else
+                        mov vSlot,LINES_VIS-1
+                .endif
+                mov ah,vSlot
+                xor al,al               ; AX = slot*256: vSlot is a byte,
+                mov bx,offset vCache    ; the 8-bit load keeps sizes legal
+                add bx,ax
+                mov wDest,bx           ; parse the line into the slot
+                call RdLine
+                mov si,bx
+                mov ax,curLine
+                mov vcTop,ax            ; the cache slid up one
+        .else
+                mov vcValid,0           ; the slots no longer match the
+                call RdLine             ; view: parse the top into lBuf
+                mov si,offset lBuf
+        .endif
+        mov wDest,offset lBuf
         mov ax,word ptr savPos
         mov word ptr curPos,ax
         mov ax,word ptr savPos+2
         mov word ptr curPos+2,ax
         call SeekSoft                   ; resync: soft, no refill (fix 48)
-        mov si,offset lBuf
         mov di,160+2                    ; draw the line on row 1 (ES=video
         call WrCntRow                   ; was kept by RdLine/Seek, fix 38)
         call DrwBar
@@ -1261,11 +1413,12 @@ DrwUp1 endp
 ;------------------------------------------------------------------------------
 ; DrwDn1 - paint one line DOWN without a full redraw: move the content
 ; up one row with one REP and draw only the new bottom row.
-; File mode: ScrDn left curPos at the start of the new TOP line; the new
-; BOTTOM line lies LINES_VIS-1 lines below: scan to it (buffered, no DOS
-; calls while it fits the block), read it, paint it, then restore curPos
-; through SeekSoft (fix 48). RdLine preserves CX, so the scan loop keeps
-; its counter in CX directly (fix 53: no push/pop per line).
+; File mode (fix 64): with a valid cache (vcTop == curLine-1) the new
+; bottom line's start comes from vPos and ONE parse fills the slot
+; the old top line just left (line mod 23: 22 = -1) - 23 parses became
+; 1. Cold, the 23 rows are parsed straight into the cache slots (fix
+; 63) while vPos records every start, so the next Down is hot; the
+; restore goes through SeekSoft either way (fix 48).
 ; STDIN mode (fix 50): ScrDn just appended the new bottom line to the
 ; ring - paint that slot, nothing is re-read from the pipe.
 ;------------------------------------------------------------------------------
@@ -1294,19 +1447,109 @@ DrwDn1 proc
                 mov word ptr savPos,ax
                 mov ax,word ptr curPos+2
                 mov word ptr savPos+2,ax
-                ; skip lines 2..LINES_VIS-1, then read the new bottom line
-                mov cx,LINES_VIS-1
-                jcxz @@rd
-@@adv:  call RdLine
-                loop @@adv
-@@rd:   call RdLine                     ; lBuf = new bottom line
+                .if (vcValid && vcTop==curLine-1)
+                        ; hot (fix 64): vPos knows where the new bottom
+                        ; line starts - ONE parse, zero extra reads. The
+                        ; new bottom (line curLine+22) lands in the slot
+                        ; the old top (line curLine-1) just left: slots
+                        ; are line mod 23 and 22 = -1 (mod 23)
+                        mov ax,curLine
+                        add ax,LINES_VIS-1
+                        and ax,31
+                        shl ax,2                ; vPos: bottom line (64)
+                        mov si,ax               ; SI indexes (no [DX] on
+                        mov ax,word ptr vPos[si] ; 8086, fix 64)
+                        mov word ptr curPos,ax
+                        mov ax,word ptr vPos[si+2]
+                        mov word ptr curPos+2,ax
+                        call SeekSoft           ; usually inside the block
+                        mov ah,vSlot
+                        xor al,al               ; AX = slot*256 (8-bit
+                        mov bx,offset vCache    ; load: vSlot is a byte)
+                        add bx,ax
+                        mov wDest,bx           ; parse into the freed slot
+                        call RdLine
+                        mov si,bx
+                        ; the line below the new view (the next Down's
+                        ; hot read) starts where RdLine stopped (64)
+                        mov ax,curLine
+                        add ax,LINES_VIS
+                        and ax,31
+                        shl ax,2
+                        mov di,ax               ; DI indexes: SI already
+                        mov ax,word ptr curPos   ; holds the paint slot
+                        mov word ptr vPos[di],ax
+                        mov ax,word ptr curPos+2
+                        mov word ptr vPos[di+2],ax
+                        mov ax,curLine
+                        mov vcTop,ax            ; the cache slid down one
+                        inc vSlot
+                        .if (vSlot >= LINES_VIS)
+                                mov vSlot,0
+                        .endif
+                .else
+                        ; cold: rebuild the cache for this view (fix 63)
+                        mov ax,curLine
+                        xor dx,dx
+                        mov bx,LINES_VIS
+                        div bx                  ; vSlot = curLine mod 23
+                        mov vSlot,dl
+                        mov ax,dx
+                        mov ah,al
+                        xor al,al               ; AX = slot*256
+                        mov bx,offset vCache
+                        add bx,ax
+                        mov ax,curLine
+                        and ax,31
+                        shl ax,2                ; vPos: row 0 (64)
+                        mov di,ax               ; DI indexes (no [DX] on
+                        mov cx,LINES_VIS        ; 8086, fix 64)
+@@fl:           mov wDest,bx           ; parse row i straight into slot
+                        mov ax,word ptr curPos  ; vPos: row i's start (64)
+                        mov word ptr vPos[di],ax
+                        mov ax,word ptr curPos+2
+                        mov word ptr vPos[di+2],ax
+                        call RdLine
+                        add bx,SLOTSZ
+                        .if (bx >= offset vCache+LINES_VIS*SLOTSZ)
+                                mov bx,offset vCache
+                        .endif
+                        add di,4
+                        .if (di >= VPOSN*4)
+                                xor di,di
+                        .endif
+                        loop @@fl
+                        movzx ax,vSlot         ; AX = vSlot: the bottom
+                        add ax,LINES_VIS-1     ; row's slot is vSlot+22,
+                                                ; mod 23 (sizes stay legal)
+                        .if (ax >= LINES_VIS)
+                                sub ax,LINES_VIS
+                        .endif
+                        mov ah,al
+                        xor al,al
+                        mov si,offset vCache
+                        add si,ax
+                        mov ax,curLine          ; vPos: the line below
+                        add ax,LINES_VIS        ; the view (next Down 64)
+                        and ax,31
+                        shl ax,2
+                        mov di,ax               ; DI indexes (fix 64)
+                        mov ax,word ptr curPos
+                        mov word ptr vPos[di],ax
+                        mov ax,word ptr curPos+2
+                        mov word ptr vPos[di+2],ax
+                        mov ax,curLine
+                        mov vcTop,ax
+                        mov vcValid,1
+                .endif
+                mov wDest,offset lBuf
                 ; restore curPos and resync the buffer with it
                 mov ax,word ptr savPos
                 mov word ptr curPos,ax
                 mov ax,word ptr savPos+2
                 mov word ptr curPos+2,ax
                 call SeekSoft
-                mov si,offset lBuf
+                ; fall through: SI = the new bottom line's slot
         .else
                 ; ring: the slot ScrDn just filled is the new bottom row
                 mov ax,rIdx
@@ -1327,33 +1570,28 @@ DrwDn1 proc
 DrwDn1 endp
 
 ;------------------------------------------------------------------------------
-; WrCntRow - paint one line on a content row. DS:SI = ASCIZ line start
-; (lBuf or a ring slot), DI = byte offset of the row's column 1 in the
-; video page (ES = video segment). The horizontal window hPos is skipped
-; first (fix 47: stopping at the line's NUL; fix 61: LODSW pairs, the
-; NUL half rewinds SI so the paint loop reads it, not stale slot bytes),
-; then LINEWID cells are written with the attribute and only the tail is
-; padded with one REP STOSW (fixes 15/38/61). The paint loop is unrolled
-; by two cells per iteration; the pad count comes from the pair counter
-; CX (2*CX / 2*CX+1). Clobbers AX CX SI DI.
+; WrCntRow - paint one line on a content row. DS:SI = slot base (lBuf,
+; an rBuf ring slot or a vCache view slot), DI = byte offset of the
+; row's column 1 in the video page (ES = video segment). The slot's
+; LENGTH BYTE at slot+255 (fix 66: every slot is LBUFCAP chars + NUL
+; + its length, written once by RdLine and carried by RingAppend)
+; replaces the hPos skip walk: when the line reaches the window its
+; start is one ADD away, and a line that ends left of it pads the
+; whole row with one REP STOSW - stale slot bytes are never touched
+; and the 1.08 NUL-backtrack cases are gone (fixes 15/38/61/66). The
+; paint loop is unrolled by two cells per iteration; the pad count
+; comes from the pair counter CX (2*CX / 2*CX+1). Clobbers AX CX SI DI.
 ;------------------------------------------------------------------------------
 WrCntRow proc
-        mov cx,hPos
-        jcxz @@g
-        shr cx,1                        ; pairs to skip (fix 61): one
-        jcxz @@o                        ; LODSW+two tests per two chars
-@@s2:   lodsw
-        or al,al
-        jz @@sl                         ; NUL low: the line ends left of
-        or ah,ah                        ; the window
-        jz @@sh
-        loop @@s2
-        .if (hPos & 1)                  ; the odd column of the window
-@@o:           cmp byte ptr [si],0
-               je @@g
-               inc si
+        mov ah,ATTR_CONT
+        mov al,byte ptr [si+255]        ; the line's length (fix 66)
+        .if (al <= byte ptr hPos)       ; the line ends left of the
+                mov ax,A_CONT or ' '    ; window: pad the whole row
+                mov cx,LINEWID          ; (HPOSMAX < 256: the low byte
+                rep stosw               ; of hPos decides, fix 66)
+                ret
         .endif
-@@g:    mov ah,ATTR_CONT
+        add si,hPos                     ; window start: one ADD, no walk
         mov cx,38                       ; 38 pairs + the 77th char (61)
 @@p:    lodsb
         or al,al
@@ -1382,11 +1620,6 @@ WrCntRow proc
         mov ax,A_CONT or ' '
         rep stosw
         ret
-@@sl:   dec si                          ; SI back onto the NUL: the paint
-        dec si                          ; loop must read it, not stale
-        jmp @@g                         ; slot bytes past it
-@@sh:   dec si
-        jmp @@g
 WrCntRow endp
 
 ;------------------------------------------------------------------------------
@@ -1552,8 +1785,10 @@ RdLine proc uses bx cx dx si di bp
         push es
         push ds
         pop es                          ; ES = DS: the store loop uses
-        mov di,offset lBuf              ; STOSB (fix 60); the caller's ES
-        mov cx,LBUFCAP                  ; is restored at the single exit
+        mov di,wDest                    ; STOSB (fixes 60/63); the caller's
+        mov cx,LBUFCAP                  ; ES is restored at the single exit
+                                        ; wDest = lBuf unless DrwCnt aims
+                                        ; a view-cache slot at it (fix 63)
         mov byte ptr [di],0
         xor dx,dx                       ; exit reason: 0 = EOF, 1 = EOL
         cmp isFile,0
@@ -1584,8 +1819,9 @@ RdLine proc uses bx cx dx si di bp
 @@sloop: mov ax,bx
         sub ax,si                       ; bytes left in the block
         jz @@refill                     ; block consumed: refill
-        mov cx,offset lBuf+LBUFCAP
-        sub cx,di                       ; capacity left in lBuf
+        mov cx,wDest
+        add cx,LBUFCAP                  ; target end: lBuf or a vCache
+        sub cx,di                       ; slot (fix 63): capacity left
         jz @@sful                       ; full line: consume the rest
         cmp ax,cx
         jbe @@sn
@@ -1655,10 +1891,9 @@ RdLine proc uses bx cx dx si di bp
 ; Entry: AX = bytes left in the block, SI = first byte, BX = block end.
 ; The line is not stored, so a "data" half needs no action at all.
 @@full: mov cx,ax
-        shr cx,1
-        shr cx,1                        ; CX = doublewords (fix 59)
-        jz @@t4                         ; < 4 bytes: byte tail
-@@f4:   lodsw                           ; P1 = AL, P2 = AH
+        shr cx,3                        ; CX = 8-byte units (fix 67:
+        jz @@t4                         ; unroll-8 halves the LOOP toll)
+@@f8:   lodsw                           ; P1 = AL, P2 = AH
         sub al,10
         cmp al,3                        ; P1 in 0Ah..0Dh?
         jbe @@candlo
@@ -1666,15 +1901,29 @@ RdLine proc uses bx cx dx si di bp
         cmp ah,3                        ; P2 in 0Ah..0Dh?
         jbe @@candhi
         lodsw                           ; P3/P4: the same pair contract
-        sub al,10                       ; (AL = P3-10, AH = P4, SI past
-        cmp al,3                        ; the second pair), so the P1/P2
-        jbe @@candlo                    ; handlers serve all four halves
+        sub al,10                       ; (AL = P-10, AH = the partner
+        cmp al,3                        ; byte, SI past the pair), so the
+        jbe @@candlo                    ; shared @@candlo/@@candhi
+        sub ah,10                       ; handlers serve all eight halves
+        cmp ah,3
+        jbe @@candhi
+        lodsw                           ; P5/P6
+        sub al,10
+        cmp al,3
+        jbe @@candlo
         sub ah,10
         cmp ah,3
         jbe @@candhi
-@@next: loop @@f4
+        lodsw                           ; P7/P8
+        sub al,10
+        cmp al,3
+        jbe @@candlo
+        sub ah,10
+        cmp ah,3
+        jbe @@candhi
+@@next: loop @@f8
 @@t4:   mov ax,bx
-        sub ax,si                       ; 0..3 bytes (a VT-heavy round can
+        sub ax,si                       ; 0..7 bytes (a VT-heavy round can
         jz @@refill                     ; leave more): byte tail
         mov cx,ax
 @@t4b:  lodsb
@@ -1742,6 +1991,10 @@ RdLine proc uses bx cx dx si di bp
 @@eof:                                  ; EOF from @@refill: bIdx=0 there
 @@dones:                                ; slow exit: bIdx is already exact
         mov byte ptr [di],0
+        mov ax,di                        ; the slot's length byte (66):
+        sub ax,wDest                     ; AX = chars of this line, stored
+        mov bx,wDest                     ; at [slot+255]: WrCntRow jumps
+        mov byte ptr [bx+255],al        ; to the window start with one ADD
         mov ax,word ptr bBase           ; curPos = bBase+bIdx, once per
         add ax,bIdx                     ; line (fix 37)
         mov word ptr curPos,ax
@@ -1754,9 +2007,9 @@ RdLine proc uses bx cx dx si di bp
         jmp @@ret0
 @@eores:
         xor ax,ax                       ; EOF: a partial line still counts
-        cmp byte ptr lBuf,0             ; (CountLines decides by itself
-        je @@ret0                       ; in count mode, fix 49)
-        inc ax
+        cmp di,wDest                    ; nothing stored = no partial line
+        je @@ret0                       ; (one CMP, right for any wDest and
+        inc ax                          ; for the store-less count mode)
 @@ret0: pop es                          ; restore the caller's ES (60)
         ret
 @@refill:
@@ -1860,7 +2113,7 @@ WrTxt proc
 WrTxt endp
 
 ;------------------------------------------------------------------------------
-; DrwHdr - title bar: "4VIEW 1.07 - <path\name>" (or STDIN). Painted by
+; DrwHdr - title bar: "4VIEW[386] 1.10 - <path\name>" (or STDIN). Painted by
 ; Init and repainted once the full path is resolved (fix 30). Writes
 ; title + path and pads the rest of the bar - no full-row clear (38).
 ;------------------------------------------------------------------------------
@@ -1907,11 +2160,12 @@ DrwFrm proc uses ax cx di
         mov es,vSeg
         mov cx,LINES_VIS
         mov di,160
-@@s:    mov ax,A_CONT or 0BAh
-        mov es:[di],ax
-        mov es:[di+158],ax
-        add di,160
-        loop @@s
+        mov ax,A_CONT or 0BAh
+        .repeat                         ; one pass, painted at Init (72)
+                mov es:[di],ax
+                mov es:[di+158],ax
+                add di,160
+        .untilcxz
         ret
 DrwFrm endp
 
@@ -1922,13 +2176,27 @@ DrwFrm endp
 ; top line is line 0 and CountLines stored lines 0..22 while scanning).
 ; Both paint through RingPaint with ZERO file access - the initial
 ; Draw and Home do no seek, no read and no line parse.
-; File mode otherwise: no MUL (fix 13), BP carries the row base and
+; Cache hit (fix 63): the view cache already holds this view's 23
+; lines (curLine == vcTop) - RingPaint on vCache, zero file access:
+; Left/Right h-scroll and popups repaint for free.
+; File mode otherwise (fix 63): every row is parsed straight into its
+; vCache slot (wDest), vPos records each start (fix 64) and the view
+; becomes the cached one. No MUL (fix 13), BP carries the row base and
 ; advances by 160. Each line is written once and only the unused tail
 ; is padded - EOF rows are cleared explicitly.
 ;------------------------------------------------------------------------------
-DrwCnt proc uses ax cx dx si di bp
+DrwCnt proc uses ax bx cx dx si di bp
         .if (!isFile || (ringView && !curLine))
                 call RingPaint
+                ret
+        .endif
+        .if (vcValid && curLine==vcTop)
+                ; view-cache hit (fix 63): the same 23 lines are parsed
+                ; already (Left/Right, pop-up close) - paint the slots,
+                ; zero seeks, reads and line parses
+                mov paintBuf,offset vCache
+                call RingPaint
+                mov paintBuf,offset rBuf
                 ret
         .endif
         mov es,vSeg
@@ -1937,15 +2205,36 @@ DrwCnt proc uses ax cx dx si di bp
         mov word ptr savPos,ax
         mov word ptr savPos+2,dx
         call SeekSoft                   ; inside the block: no DOS
+        mov ax,curLine                  ; vSlot = curLine mod 23: line
+        xor dx,dx                       ; curLine+i lands in slot vSlot+i
+        mov bx,LINES_VIS                ; (the ring discipline, fix 63)
+        div bx
+        mov vSlot,dl
+        mov ax,dx
+        mov ah,al
+        xor al,al                       ; AX = slot*256 (no shl ax,8)
+        mov bx,offset vCache
+        add bx,ax                       ; BX = slot cursor of row 0
+        mov ax,curLine
+        and ax,31
+        shl ax,2                        ; AX = (curLine and 31)*4
+        mov dx,ax                       ; DX = vPos entry of row 0
         mov di,160+2                    ; row 1, column 1
         mov cx,LINES_VIS
         .repeat
                 mov bp,di               ; BP = content start of this row
                 push cx
+                mov wDest,bx           ; parse row i straight into its
+                                        ; cache slot: no copy pass (63)
+                mov si,dx               ; SI indexes the entry (no [DX]
+                mov ax,word ptr curPos  ; on 8086, fix 64): vPos gets
+                mov word ptr vPos[si],ax ; row i's line start (64)
+                mov ax,word ptr curPos+2
+                mov word ptr vPos[si+2],ax
                 call RdLine             ; keeps DI on the row start (uses)
                 or al,al
                 jz @@e
-                mov si,offset lBuf
+                mov si,bx
                 call WrCntRow           ; text + pad the tail (fix 38)
                 jmp @@n
 @@e:            mov ax,A_CONT or ' '    ; EOF: empty row (fix 46: one
@@ -1953,8 +2242,27 @@ DrwCnt proc uses ax cx dx si di bp
                 rep stosw
 @@n:            mov di,bp               ; both paths rejoin here: STOSW
                 add di,160              ; left DI mid-row (fix 46b)
+                add bx,SLOTSZ
+                .if (bx >= offset vCache+LINES_VIS*SLOTSZ)
+                        mov bx,offset vCache
+                .endif
+                add dx,4
+                .if (dx >= VPOSN*4)
+                        xor dx,dx
+                .endif
                 pop cx
         .untilcxz
+        ; vPos entry of the line AFTER the bottom row (the next Down's
+        ; fast path): curPos is on it now, DX already points there (64)
+        mov si,dx                       ; SI indexes (no [DX] on 8086)
+        mov ax,word ptr curPos
+        mov word ptr vPos[si],ax
+        mov ax,word ptr curPos+2
+        mov word ptr vPos[si+2],ax
+        mov ax,curLine
+        mov vcTop,ax                    ; the cache now holds this view
+        mov vcValid,1
+        mov wDest,offset lBuf           ; everyone else parses to lBuf
         mov ax,word ptr savPos
         mov dx,word ptr savPos+2
         mov word ptr curPos,ax
@@ -1974,9 +2282,10 @@ DrwBar proc uses ax bx cx di
         mov cx,LINES_VIS
         mov di,160+156
         mov ax,A_SCRL or 0B0h
-@@t:    mov es:[di],ax
-        add di,160
-        loop @@t
+        .repeat                         ; the rail: one pass per frame (72)
+                mov es:[di],ax
+                add di,160
+        .untilcxz
         mov ax,totLines
         or ax,ax
         jz @@d
@@ -2004,9 +2313,10 @@ DrwBar proc uses ax bx cx di
 @@f:    mov cx,LINES_VIS                ; file fits the window: full thumb
         mov di,160+156
         mov ax,A_THMB or 0DBh
-@@g:    mov es:[di],ax
-        add di,160
-        loop @@g
+        .repeat
+                mov es:[di],ax
+                add di,160
+        .untilcxz
 @@d:    ret
 DrwBar endp
 
@@ -2148,20 +2458,20 @@ PopUp proc uses bx cx dx si di bp
         mov dx,popLines
         add dx,4                        ; rows = lines + 4
         mov si,popOff
-        push es
-        push ds
+        push es, ds                     ; SMART.INC multi push
         mov ax,vSeg
         mov ds,ax
         mov ax,ss                       ; data segment (COM: SS==DS)
         mov es,ax
         mov di,offset popSave
-@@sv:   mov cx,bp
-        add cx,2
-        add cx,cx                       ; row size in bytes
-        BLKCP                           ; widest copy of the build (36)
-        AdvRow si
-        dec dx
-        jnz @@sv
+        .repeat                         ; one row per pass (72)
+                mov cx,bp
+                add cx,2
+                add cx,cx               ; row size in bytes
+                BLKCP                   ; widest copy of the build (36)
+                AdvRow si
+                dec dx
+        .untilz
         pop ds
         ; draw the window (ES=video). AH carries ATTR_POP through the
         ; whole draw: nothing clobbers AX any more (fix 33).
@@ -2203,13 +2513,14 @@ PopUp proc uses bx cx dx si di bp
         mov si,offset popSave
         mov dx,popLines
         add dx,4
-@@rs:   mov cx,bp
-        add cx,2
-        add cx,cx
-        BLKCP
-        AdvRow di
-        dec dx
-        jnz @@rs
+        .repeat                         ; one row per pass (72)
+                mov cx,bp
+                add cx,2
+                add cx,cx
+                BLKCP
+                AdvRow di
+                dec dx
+        .untilz
         .if (mPres)
                 mov ax,1
                 int 33h
@@ -2238,9 +2549,8 @@ PopLine proc
         stosw
         loop @@c
         jcxz @@cl                       ; exactly BP chars: row done
-@@pad:  mov al,' '
-        stosw
-        loop @@pad
+@@pad:  mov ax,A_POP or ' '
+        rep stosw                       ; the remaining cells in one REP
 @@cl:   mov al,0BAh
         stosw
         AdvRow di
@@ -2249,7 +2559,10 @@ PopLine endp
 
 ;------------------------------------------------------------------------------
 ; Done - close the file and put the screen and the cursor back exactly
-; as they were when 4VIEW started (fix 22). The handle is closed only
+; as they were when 4VIEW started (fix 22). When Init forced mode 3
+; (fix 71) the user's mode is set back instead of the text-page copy:
+; the original page content is unrecoverable either way, the mode set
+; at entry already cleared it. The handle is closed only
 ; when the file was really opened: the open-error path runs Done with
 ; isFile=1 and hFile=0, and closing handle 0 would kill STDIN (fix 30).
 ;------------------------------------------------------------------------------
@@ -2258,11 +2571,17 @@ Done proc
                 mov ax,2
                 int 33h                 ; hide the mouse sprite first
         .endif
-        mov es,vSeg
-        mov si,offset svScr
-        xor di,di
-        mov cx,4000
-        BLKCP                           ; original screen back (fix 36)
+        .if (svForced)                  ; the mode was forced at entry (71)
+                xor ah,ah               ; put the user back in their mode
+                mov al,svMode
+                int 10h
+        .else
+                mov es,vSeg
+                mov si,offset svScr
+                xor di,di
+                mov cx,4000
+                BLKCP                   ; original screen back (fix 36)
+        .endif
         mov ah,1
         mov cx,svShape
         int 10h                         ; original cursor shape
@@ -2393,28 +2712,42 @@ hPos            dw 0                    ; horizontal window start (fix 47)
 rIdx            dw 0                    ; next ring slot (fixes 50/55)
 cntMode         db 0                    ; RdLine consume-only pass (49)
 ringView        db 0                    ; ring holds lines 0..22 (55)
+vSlot           db 0                    ; view cache: top row's slot (63)
+vcTop           dw 0                    ; view cache: top line number (63)
+vcValid         db 0                    ; slots hold lines vcTop..+22 (63)
 popRow          dw 0
 popCol          dw 0
 popLines        dw 0
 popOff          dw 0            ; pop-up corner offset, reused 3x (fix 33)
 zEnd            label byte
 isFile          db 0            ; set by ParseCmd: NEVER zeroed by Init
+wDest           dw offset lBuf ; RdLine store target (63): pointers,
+paintBuf        dw offset rBuf  ; MUST NOT be cleared by Init (fix 63)
 vSeg            dw 0B800h       ; Init sets B000h for mono (mode 7)
 svPage          db 0
+svMode          db 0                    ; video mode at entry (fix 71)
+svForced        db 0                    ; Init forced mode 3 (fix 71)
 svShape         dw 0
 svCurs          dw 0
 fName           db 65 dup(0)
-lBuf            db SLOTSZ dup(0)       ; one line, up to 255 chars (47)
+lBuf            db SLOTSZ dup(0)       ; one line: LBUFCAP chars + NUL
+                                        ; + length byte at 255 (47/66)
 stBuf           db 96 dup(0)
 bBuf            db BUFSZ dup(0)
 cache           dd CACHE_SZ dup(0)
 svScr           db 4000 dup(0)          ; saved text page (fix 22)
 popSave         db HLP_H*WWIN*2 dup(0)  ; saved region under the pop-ups
 rBuf            db RINGN*SLOTSZ dup(0)  ; ring: view #1 / STDIN window (50)
+vCache          db LINES_VIS*SLOTSZ dup(0) ; the current view's lines (63)
+vPos            dd VPOSN dup(0)          ; line start ring: line j -> j&31 (64)
 cBuf            db 0                    ; 1-byte STDIN staging buffer
 tBuf            db 128 dup(0)           ; Truename scratch (fix 30)
 sSTDIN          db "STDIN",0
+if USE386
+sHdr1           db "4VIEW386 ",'0'+VERMAJ,".",'0'+VMIN/10,'0'+VMIN mod 10," - ",0
+else
 sHdr1           db "4VIEW ",'0'+VERMAJ,".",'0'+VMIN/10,'0'+VMIN mod 10," - ",0
+endif
 sLoad           db "Loading ",0
 sDots           db "...",0
 sLn             db "Line ",0
@@ -2422,7 +2755,11 @@ sKey            db "   ",24,25,27,26," PgUp PgDn F1=Help F10=About ESC",0
 sErr            db "Cannot open file.",13,10,'$'
 ; help lines: printed by ShowHelp and drawn inside the F1 window (fix 21)
 helpTab         dw a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17,a18,a19
+if USE386
+a1              db "4VIEW386 ",'0'+VERMAJ,".",'0'+VMIN/10,'0'+VMIN mod 10," - text viewer for DOS",0
+else
 a1              db "4VIEW ",'0'+VERMAJ,".",'0'+VMIN/10,'0'+VMIN mod 10," - text viewer for DOS",0
+endif
 a2              db "Copyright (c) 2025-2026",0
 a3              db "Javier Gutierrez Chamorro (Guti)",0
 a4              db 0
@@ -2439,8 +2776,16 @@ a14             db 0
 a15             db "Mouse: click scrollbar, wheel or",0
 a16             db "  right button scrolls the view",0
 a17             db 0
+if USE386
+a18             db "Usage: 4VIEW386 [file]",0
+else
 a18             db "Usage: 4VIEW [file]",0
+endif
+if USE386
+a19             db "       TYPE file | 4VIEW386",0
+else
 a19             db "       TYPE file | 4VIEW",0
+endif
 ; about lines: drawn inside the F10 window (fix 29). @Date/@Time are
 ; stamped by ASMC at assembly time; the quotes are added around their
 ; expansion so the parser accepts the date slashes and time colons.
@@ -2448,7 +2793,11 @@ BUILD_DATE      catstr <">,@Date,<">
 BUILD_TIME      catstr <">,@Time,<">
 AV              = __ASMC__              ; real ASMC version (e.g. 240)
 aboutTab        dw b1,b2,b3,b4,b5,b6,b7
+if USE386
+b1              db "4VIEW386 ",'0'+VERMAJ,".",'0'+VMIN/10,'0'+VMIN mod 10,0
+else
 b1              db "4VIEW ",'0'+VERMAJ,".",'0'+VMIN/10,'0'+VMIN mod 10,0
+endif
 b2              db "Copyright (c) 2025-2026",0
 b3              db "Javier Gutierrez Chamorro (Guti)",0
 b4              db "Built ",BUILD_DATE," ",BUILD_TIME,0
