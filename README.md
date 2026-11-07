@@ -4,6 +4,9 @@
 
 Copyright (c) 2025 Javier Gutiérrez Chamorro (Guti)
 
+<img width="720" height="400" alt="image" src="https://github.com/user-attachments/assets/d8fa4162-b0cb-49f8-9d23-08b6b9995a40" />
+
+
 ---
 
 ## Description
