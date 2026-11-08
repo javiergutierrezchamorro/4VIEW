@@ -1,6 +1,17 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 1.18 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 1.19 - Turbo Vision style text viewer for DOS (ASMC)
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
+; Revision 1.19 fixes (built on top of the 1.18 source - fixes 109-114
+; are all still in; see 115-116 at the end of this header): the
+; assembler itself now emits the final ~6 KB COM in ONE step, no
+; truncation script - the ten bulk buffers became pure offset equates
+; into the RAM DOS gives a COM beyond its image (fix 115), so the
+; 35.297 zero bytes a plain "ASMC -bin" run used to pad after the
+; marker (the "ASMC gives me 40K" report) are gone from the FILE, and
+; every offset, every code byte and the whole behavior are the ones
+; 1.18 had - the only byte that changes in the image is the stamp's
+; version digit.
+;
 ; Revision 1.18 fixes (from a full read of the source; see fixes 109-114 at
 ; the end of this header): the mouse wheel/right button decoding, the line
 ; skipped by the first Down after loading, the INT 10h blink call, FillBuf
@@ -27,7 +38,10 @@
 ; shift macro bodies (fix 103), and the UASM builds emit genuine
 ; 8086 encodings (fix 105).
 ;
-; Assemble with ASMC (flat COM, single segment):
+; Assemble with ASMC (flat COM, single segment) - the COM comes out
+; at its FINAL size (~6 KB) in this one step, fix 115: the bulk
+; buffers are offsets into the RAM beyond the image, so there is no
+; dup(?) tail to cut any more:
 ;     ASMC -bin -Fo 4VIEW.COM 4VIEW.ASM          (8088/8086, default)
 ; 386+ build (immediate shifts + 32-bit string ops; the title bar and
 ; About say "4VIEW386", fix 68):
@@ -736,6 +750,29 @@
 ;     the 8086 build loses a dead PUSH AX / MOV AX,CX / POP AX.
 ; 114. Version 1.18; the COM cut marker is "<4VIEW18>" (update the script
 ;     that truncates the COM at the marker).
+;
+; Revision 1.19 fixes:
+; 115. THE ASSEMBLER ITSELF NOW EMITS THE ~6 KB COM. Fix 97 moved the
+;      ten bulk buffers (fName/lBuf/stBuf/bBuf/cache/svScr/popSave/
+;      vCache/vPos/tBuf, 35.297 bytes) to a dup(?) tail behind the
+;      FILEEND marker and cut the SHIPPED COMs right after it - but a
+;      plain "ASMC -bin" run pads the single-segment image with zeros
+;      up to the LAST DECLARED ITEM, so an uncut build is 41 KB of
+;      which 35.297 are ballast zeros (the "a ti el .COM te da 5K y
+;      ASMC me da 40K" report): the cut was a second, manual build
+;      step the source did not perform. The ten buffers are now pure
+;      offset EQUates into the RAM DOS gives a COM beyond its image -
+;      exactly where the cut COM already kept them at runtime (same
+;      footprint, same write-before-read audit, vCache still cleared
+;      by Init) - so there is NO declared item after the stamp any
+;      more: ASMC, JWasm and LINK16 /TINY all emit the final-size COM
+;      in one step and the stamp is just a version marker now. The
+;      equate chain reproduces the dup(?) offsets byte for byte (no
+;      alignment changes), so both builds come out IDENTICAL to 1.18
+;      except the stamp's version digit - verified on ASMC 2.41 and
+;      UASM 2.57 (8086 and -3) by image comparison.
+; 116. Version 1.19 (needs SMART.INC v2.43); the image stamp is
+;      "<4VIEW19>".
 ;------------------------------------------------------------------------------
 option dotname
 .model tiny
@@ -765,8 +802,8 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
 .code
 org 100h
 
-VERMAJ      equ 1                       ; product version 1.17
-VMIN        equ 18
+VERMAJ      equ 1                       ; product version 1.19
+VMIN        equ 19
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -989,7 +1026,8 @@ Init proc
         ; (fix 97): the EOF rows of short files, STDIN slots below the
         ; first fill and ring slots beyond a short pipe must paint as
         ; blank. The rest of the bulk data (fix 97) is write-before-
-        ; read and lives as dup(?), so the COM file carries none of it
+        ; read and lives past the image (fix 115), so the COM file
+        ; carries none of it
         mov di,offset vCache
         mov cx,RSLOTS*SLOTSZ
         BLKFIL                          ; AX = 0 here: the wide clear
@@ -2309,7 +2347,7 @@ GetByte proc
                 .endif
                 xor bx,bx
         .endif
-        mov al,bBuf[bx]
+        mov al,byte ptr bBuf[bx]
         inc bIdx
         clc
         ret
@@ -3364,9 +3402,11 @@ U2A endp
 ;------------------------------------------------------------------------------
 ; Data - inside the code segment so "-bin"/COM output is self-contained.
 ; zStart..zEnd is cleared by Init with a single REP STOSB.
-; FIX 97: the bulk buffers live at the END as dup(?) behind the
-; FILEEND marker and the shipped COMs are cut right after it
-; (41.174 -> 5.941 bytes in 1.14). A write-before-read
+; FIX 97 moved the bulk buffers to the END as dup(?) behind the
+; FILEEND marker, cut right after by a build script (41.174 ->
+; 5.941 bytes in 1.14); FIX 115 retires the cut: the buffers are
+; now offset equates (see the tail) and the assembler emits the
+; final image in one step. A write-before-read
 ; audit per buffer backs the change: fName is written by ParseCmd
 ; before any read (and never read when isFile=0), lBuf's [0] and
 ; length byte are written by RdLine's entry/exit before any paint,
@@ -3492,27 +3532,36 @@ b6              db "Assembler: ASMC ",'0'+AV/100,".",'0'+(AV mod 100)/10,'0'+AV 
 b7              db "Free to use, modify and distribute.",0
 idleCnt         db 0                    ; idle-pass counter (fix 81); it
                                         ; only feeds the mod-8 throttle
-; --- fix 97: the bulk tail. dup(?): the shipped COMs are cut right
-; after the FILEEND marker below (the assembler pads the emitted
-; file with zeros up to the last declared item; the cut is a search
-; for the marker + truncate). The sizes still reserve real memory:
-; DOS gives a COM the whole segment. Init clears vCache (see above);
-; every other buffer is written before it is read.
-FILEEND         db "<4VIEW18>",0       ; last initialized bytes: the
-                                        ; truncation marker (fix 97)
-fName           db 65 dup(?)
-lBuf            db SLOTSZ dup(?)       ; one line: LBUFCAP chars + NUL
-                                        ; + length byte at 255 (47/66)
-stBuf           db 96 dup(?)
-bBuf            db BUFSZ dup(?)
-cache           dd CACHE_SZ dup(?)
-svScr           db 4000 dup(?)          ; saved text page (fix 22)
-popSave         db HLP_H*WWIN*2 dup(?)  ; saved region under the pop-ups
-vCache          db RSLOTS*SLOTSZ dup(?) ; the view buffer (fixes 63/85):
+; --- fix 115 (over fix 97): the bulk tail is no longer DECLARED
+; data. The ten work buffers are pure offset EQUates into the RAM DOS
+; gives a COM beyond its image - exactly the byte offsets the 1.14
+; dup(?) layout produced (same order, same sizes, no alignment
+; games), so every code byte is unchanged; but the assembler now has
+; NO item after the FILEEND stamp and ends the emitted image at it:
+; "ASMC -bin" alone gives the final ~6 KB COM, no truncation step (a
+; plain -bin run used to pad 35.297 zero bytes up to the last dup(?)
+; item - the reported 40K). The load footprint is the one fix 97
+; audited: Init clears vCache (the only read-before-write buffer),
+; every other buffer is written before it is read, and the stack
+; lives ~24 KB above BMEMTOP at the top of the segment.
+FILEEND         db "<4VIEW19>",0       ; last initialized bytes: the
+                                        ; image stamp (fix 97; the cut
+                                        ; step retired by fix 115)
+BSSBASE         equ $                  ; RAM base: first byte past the image
+fName           equ BSSBASE                    ; 65 bytes (12)
+lBuf            equ fName+65                   ; SLOTSZ: LBUFCAP chars
+                                        ; + NUL + length at 255 (47/66)
+stBuf           equ lBuf+SLOTSZ                ; 96 bytes (4)
+bBuf            equ stBuf+96                   ; BUFSZ bytes (6)
+cache           equ bBuf+BUFSZ                 ; CACHE_SZ*4 (100)
+svScr           equ cache+CACHE_SZ*4           ; 4000 bytes (22)
+popSave         equ svScr+4000                 ; HLP_H*WWIN*2 (33)
+vCache          equ popSave+HLP_H*WWIN*2       ; RSLOTS*SLOTSZ (63/85):
                                         ; slots 0..22 are the file view
                                         ; cache, all 46 form the STDIN
                                         ; scrollback ring - one buffer,
                                         ; zeroed by Init (fix 97)
-vPos            dd VPOSN dup(?)         ; line start ring: line j -> j&31 (64)
-tBuf            db 128 dup(?)           ; Truename scratch (fix 30)
+vPos            equ vCache+RSLOTS*SLOTSZ       ; VPOSN*4 (64)
+tBuf            equ vPos+VPOSN*4               ; 128 bytes (30)
+BMEMTOP         equ tBuf+128           ; last RAM byte the program owns
 end
