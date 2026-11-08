@@ -2,7 +2,7 @@
 
 **Turbo Vision style text file viewer for DOS**
 
-Copyright (c) 2025 Javier Gutiérrez Chamorro (Guti)
+Copyright (c) 2025-2026 Javier Gutiérrez Chamorro (Guti)
 
 <img width="720" height="400" alt="image" src="https://github.com/user-attachments/assets/d8fa4162-b0cb-49f8-9d23-08b6b9995a40" />
 
@@ -11,7 +11,7 @@ Copyright (c) 2025 Javier Gutiérrez Chamorro (Guti)
 
 ## Description
 
-Lightweight text viewer written in 16-bit assembly. Displays text files of **any size** (does not load the whole file into RAM).
+Lightweight and ultrafast text file viewer written in 16-bit assembly. Displays text files of **any size** (does not load the whole file into RAM).
 
 Classic Turbo Vision look:
 - Blue content area, white text
@@ -21,6 +21,7 @@ Classic Turbo Vision look:
 
 ## Features
 
+- COM file of less than 4 KB
 - Arbitrary file size support (streaming + seeking)
 - Exact line count (initial pass)
 - Recent-line offset cache → real scroll-up works with pipes
