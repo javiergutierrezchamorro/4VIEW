@@ -1,6 +1,25 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 1.24 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 1.25 - Turbo Vision style text viewer for DOS (ASMC)
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
+; Revision 1.25 changes (151; the idle key poll - the hottest loop of the
+; program, ~1900 passes per keypress (fix 81) - verified by assembling
+; both builds with ASMC and diffing the COM images: the only diffs are
+; the intended bytes below):
+;  151. KEYAVAIL SETS DS=0, NOT DS=0040h: the poll loaded the BIOS data
+;       segment with "mov ax,0040h / mov ds,ax" (5 bytes, 4+2 cycles on
+;       an 8086) although the ring head/tail words live just as well at
+;       LINEAR 0:0041Ah/0:0041Ch: "xor ax,ax / mov ds,ax" is 4 bytes and
+;       3+2 cycles, and the direct displacements only gain the segment
+;       nibble (A1 1A 00 -> A1 1A 04, 3B 06 1C 00 -> 3B 06 1C 04) at
+;       zero byte cost. 1 byte and 1 cycle less per expansion, 3
+;       expansions per poll loop set (Main idle, End drain, mouse drag):
+;       3 bytes per build, ~1900 cycles per keypress on an 8088, and the
+;       386 build keeps its cycles (xor == mov imm there). ReadKey KEEPS
+;       DS=0040h (fix 25): it dereferences the head VALUE in BX
+;       ("mov ax,[bx]"), and a DS=0 form would need [bx+0040h] - 8B 47
+;       40 vs 8B 07: 1 byte MORE and 4 cycles more on an 8086, net worse
+;       in both builds. The image stamp moves to "<4VIEW25>".
+;
 ; Revision 1.24 fixes (141-150; a full read of the 1.23 source against the
 ; machine simulation: every change was first proven equivalent by the
 ; scripts/sim_rdline_124.py and sim_wrcntrow_124.py models - block sizes
@@ -1210,8 +1229,8 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
 .code
 org 100h
 
-VERMAJ      equ 1                       ; product version 1.24
-VMIN        equ 24
+VERMAJ      equ 1                       ; product version 1.25
+VMIN        equ 25
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -1421,14 +1440,17 @@ endif
 ; ZF=1 when the BIOS keyboard ring at 0040h is empty, ZF=0 when a key
 ; waits. The trailing pop ds does not touch the flags, so the result
 ; reaches the caller's .untilnz/.jnz directly (fixes 24/25/26).
-; Clobbers AX.
+; Clobbers AX. DS=0 since fix 151: the ring head/tail are reachable as
+; 0:0041Ah/0:0041Ch - one byte and one cycle less per poll than loading
+; DS=0040h (ReadKey stays on DS=0040h: it must dereference the head
+; VALUE in BX against that segment).
 ;------------------------------------------------------------------------------
 KeyAvail macro
         push ds
-        mov ax,0040h
-        mov ds,ax
-        mov ax,ds:[001Ah]               ; ring head
-        cmp ax,ds:[001Ch]               ; head == tail: buffer empty
+        xor ax,ax                       ; DS=0 (fix 151): segment 0040h
+        mov ds,ax                       ; is linear 0:0040h, so head and
+        mov ax,ds:[0041Ah]              ; tail are 0:041Ah / 0:041Ch -
+        cmp ax,ds:[0041Ch]              ; head == tail: buffer empty
         pop ds
         endm
 
@@ -4010,7 +4032,7 @@ idleCnt         db 0                    ; idle-pass counter (fix 81); it
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW24>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW25>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; the cut
                                         ; step retired by fix 115)
 BSSBASE         equ $                  ; RAM base: first byte past the image
