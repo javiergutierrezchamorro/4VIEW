@@ -1,6 +1,99 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 1.23 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 1.24 - Turbo Vision style text viewer for DOS (ASMC)
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
+; Revision 1.24 fixes (141-150; a full read of the 1.23 source against the
+; machine simulation: every change was first proven equivalent by the
+; scripts/sim_rdline_124.py and sim_wrcntrow_124.py models - block sizes
+; 8, 16 and 32 to stress every block edge - and then checked at the BYTE
+; level by assembling both builds with ASMC and diffing the COM images:
+; the only diffs are the intended instructions below):
+;  141. RDLINE'S @@c1 RE-READS [si-1] FOR NOTHING: the store scanner's P1-CR
+;       handler tested the CRLF partner with "cmp byte ptr [si-1],10" - a
+;       memory EA + read (~13-17 cycles on an 8086) - although the partner
+;       is ALREADY LOADED in AH: @@c1 is reached only from @@sp, one
+;       instruction after the LODSW that put P2 in AH (fix 54's own comment
+;       says "the partner is the ALREADY LOADED AH"; the 1.23 code
+;       contradicted it). "cmp ah,10" is behaviorally identical - proven by
+;       the simulator, which asserts AH == [si-1] at every @@c1 - and 1 byte
+;       less: ~13 cycles saved per CRLF line ending at an ODD slot of the
+;       display parse, the most common line ending of DOS text. The runtime
+;       assertion is dropped in 1.24: the single-line code cannot diverge.
+;  142. THE 386 STORE SCANNER KEEPS THE DWORD IN EBP: after the SWAR test
+;       said "no candidate", the clean dword was re-read from memory
+;       ("mov eax,[si-4]" = 66 8B 44 FC: MOV r,m costs 4 cycles on a 386
+;       against 2 for MOV r,r, plus a bus read racing the prefetch queue)
+;       although LODSD had just fetched it. EBP is DEAD inside the scanner body
+;       (BP's store/consume flag is read only at the @@fx entry - @@full,
+;       reached from @@sful, never tests it), so "mov ebp,eax" parks the
+;       dword in the register and "mov eax,ebp" feeds the STOSD: one bus
+;       read less per stored dword on the parse that PgDn/PgUp pay 23
+;       times per page. RdLine's uses list already restores BP. The
+;       simulator runs the reload and the EBP forms through the same
+;       corpora with identical output.
+;  143. WRCNTROW'S PAIR LOOPS READ ONE LODSW PER TWO CELLS: the old pair
+;       tested and stored each byte separately (11 instructions, ~73
+;       cycles per pair on an 8086: LODSW + 4 CMP/Jcc + 2 STOSB + MOV +
+;       LOOP). Both loops now build the two cells from ONE LODSW - BH
+;       carries ATTR_CONT, "mov bl,ah" saves the second char and "mov
+;       ah,bh" joins the attribute to the first: 6 instructions, ~63
+;       cycles per pair (8086) and ~25% less on the -3 build. BX is the
+;       callers' slot cursor (DrwCnt walks the view with it), so one
+;       PUSH BX/POP BX pair guards the paint section - the documented
+;       "clobbers AX CX SI DI only" contract is unchanged, and DX/BP
+;       (RingPaint's wrap limit, DrwCnt's vPos cursor and row base) are
+;       never touched. The 77-cell output is identical for every
+;       (len, hPos, content) combination: sim_wrcntrow_124.py runs the
+;       226.950-case matrix of both loops, 0 differences.
+;  144. RDLINE'S @@refill WRITES A DEAD bIdx: "mov ax,si / sub ax,offset
+;       bBuf / mov bIdx,ax" is 8 bytes that FillBuf always overwrites
+;       ("mov bIdx,0" is unconditional in FillBuf) and that no continuation
+;       reads: the EOF exit jumps to @@dones with bIdx=0 (correct - curPos
+;       = the new bBase = EOF) and @@rfin recomputes everything from SI.
+;       8 bytes and ~9 cycles per 32 KiB block removed.
+;  145. THE ORPHAN @@eof LABEL IS GONE: nothing jumps to it since fix 107
+;       routed the refill EOF through "xor dx,dx / jmp @@dones" (the label
+;       only documented a path that no longer exists); @@donef falls
+;       through to @@dones exactly as before. The fix 107 note lives at
+;       the branch that forces DX.
+;  146. COUNTLINES RESETS wDest ONLY WHEN IT MATTERS: the "mov
+;       wDest,offset lBuf" after each captured line ran for lines 0..21
+;       although the next capture re-arms wDest to its slot and RdLine
+;       only needs a real wDest from line 23 on (count mode's @@dones
+;       writes the NUL and the length byte there). The reset moved below
+;       the == LINES_VIS-1 test: 6 bytes of code saved, 3 bytes of runtime
+;       per captured line, behavior identical (the capture path re-arms
+;       wDest before every stored RdLine).
+;  147. MOUSEPOLL'S totLines CLAMP IS UNREACHABLE: row <= 22 puts the
+;       clicked line at row*(tot-23)/22 <= tot-23, and tot-23 < totLines
+;       always (tot > LINES_VIS is guaranteed by the jbe above) - the
+;       "cmp ax,totLines / jb @@clp / mov ax,totLines / dec ax" never
+;       fires (proven by brute force over tot 24..65535 x row 0..22:
+;       0 cases reach the clamp, minimum margin 65534). The 4 bytes are
+;       gone and the STRONGER invariant curLine <= totLines-23 - which
+;       DrwBar's DIV and DrwSt's percent rely on - is what the code now
+;       keeps.
+;  148. U2A POPS THE DIGIT INTO AX: the digits are pushed with AH=0 (the
+;       corrected remainder is < 10), so "pop ax / add al,'0' / stosb"
+;       replaces "pop dx / add dl,'0' / mov al,dl / stosb": 2 bytes and
+;       2 cycles less per digit, verified over all 65536 values against
+;       the decimal reference (scripts/verify_u2a_clamp.py - the 1.23
+;       algorithm is already exact for the whole 16-bit range).
+;  149. VERIFICATION NOTE - THE .if SIGNEDNESS SCARE OF THE FIX 148 DRAFT:
+;       the two "bx >= offset vCache+LINES_VIS*SLOTSZ" slot-wrap tests
+;       were flagged as SIGNED-overflow risks (an image past 8000h would
+;       flip the compare), but the ASMC listing of the 1.23 build shows
+;       the emitted branch is ALREADY "jb" (unsigned): the constant
+;       0CA07h does not fit SWORD, so ASMC classifies the compare as
+;       unsigned, and with the threshold below 8000h every BX it can
+;       reach is positive too - correct for ANY image layout. No byte is
+;       changed; the finding retires the draft fix and documents the one
+;       exception to the blanket "ASMC's .if is SIGNED" rule of fixes
+;       93/129/140 (immediates above 7FFFh compare unsigned).
+;  150. Version 1.24; the image stamp is "<4VIEW24>". SMART.INC stays at
+;       v2.43 (audited as part of this pass: the FastMul 386 paths, the
+;       shift macro bodies and the FastIMul chain are correct, and the
+;       macros 4VIEW does not use cost nothing in the image).
+;
 ; Revision 1.23 fixes (139-140; found with a byte-faithful 8086/386+DOS
 ; machine simulation running the FULL program twice per session and
 ; comparing the instruction streams, the DOS calls and the VIDEO PAGE
@@ -1117,8 +1210,8 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
 .code
 org 100h
 
-VERMAJ      equ 1                       ; product version 1.23
-VMIN        equ 23
+VERMAJ      equ 1                       ; product version 1.24
+VMIN        equ 24
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -1786,13 +1879,16 @@ CountLines proc
                 .if (al)                ; ended on CR/LF: line read
                         cmp totLines,LINES_VIS  ; still capturing? UNSIGNED
                         jae @@aft               ; (fix 93) no: view is full
-                        mov wDest,offset lBuf   ; the next parse goes to lBuf
                         cmp totLines,LINES_VIS-1
-                        jne @@aft
+                        jne @@aft               ; (fix 146: the next capture
+                                                ; re-arms wDest - the reset
+                                                ; only matters at line 22)
                         ; line 22, the last one of the view, was just read:
                         ; curPos IS the start of line 23 = the line below
                         ; the view, the first Down's hot read (fix 110: 1.17
                         ; stored it after reading line 23 = line 24's start)
+                        mov wDest,offset lBuf   ; count mode's @@dones writes
+                                                ; the NUL/length to wDest (146)
                         mov cntMode,1           ; count-only from here
                         mov si,LINES_VIS*4      ; vPos entry 23
                         VPSTORE si
@@ -2094,11 +2190,12 @@ MousePoll proc
                 div bx                  ; exact inverse of DrwBar.
                                         ; MUL/DIV kept: variable
                                         ; divisor, once per click
-                cmp ax,totLines         ; unsigned clamp (fix 23)
-                jb @@clp
-                mov ax,totLines
-                dec ax
-@@clp:          mov curLine,ax
+                                        ; (fix 147: the totLines clamp was
+                                        ; dead - row <= 22 puts the line at
+                                        ; tot-23 at most, always < totLines,
+                                        ; so the stronger invariant that
+                                        ; DrwBar/DrwSt rely on is kept)
+                mov curLine,ax
                 call GoLine
                 call Draw
 @@wr:           KeyAvail              ; ESC/keys abort the wait if the
@@ -2556,16 +2653,17 @@ DrwDn1 endp
 ; loop never probes for the NUL any more (the compare stays
 ; UNSIGNED, fix 93):
 ;   avail > LINEWID : the row is full - 38 unrolled pairs plus the
-;                     77th char, five instructions per pair instead
-;                     of the old nine (no lodsb/or/jz per byte);
+;                     77th char, one LODSW and six instructions per
+;                     pair (fix 143; fix 99 had killed the lodsb/or/jz
+;                     per byte, fix 143 kills the per-byte tests too);
 ;   1..LINEWID      : avail chars two per iteration (the odd one first,
 ;                     fix 120), then the pad cells in one REP STOSW
 ;                     (the pad count waits on the stack while LODSB
 ;                     runs);
 ;   len <= hPos     : the whole row is one REP STOSW.
 ; Clobbers AX CX SI DI only - DrwCnt holds its vPos cursor in DX,
-; RingPaint its wrap limit there and both keep BX/BP live (fix 99
-; keeps the 1.14 contract).
+; RingPaint its wrap limit there and both keep BX/BP live (fix 143
+; parks BX around the paint section: the 1.14 contract stays, 99).
 ;------------------------------------------------------------------------------
 WrCntRow proc
         mov al,byte ptr [si+255]        ; the line's length (fix 66)
@@ -2580,20 +2678,24 @@ WrCntRow proc
         mov cl,LINEWID                  ; window start on (99); CL =
         sub cl,al                       ; pad cells, CF=1: full row
         mov ah,ATTR_CONT
-        jc @@full
-        add si,hPos                     ; window start: one ADD, no walk
-        mov ch,0                        ; CX = the pad count (0..76)
-        push cx                         ; it waits here while LODSB runs
-        mov cl,al                       ; CX = chars to paint (1..77)
+        mov bh,ATTR_CONT                ; fix 143: the pair loops build
+        push bx                         ; BOTH cells from one LODSW (BH
+        jc @@full                       ; carries the attribute; BX is the
+        add si,hPos                     ; callers' slot cursor, hence the
+        mov ch,0                        ; push/pop - DX/BP are never
+        push cx                         ; touched). ~63 instead of ~73
+        mov cl,al                       ; cycles per pair on an 8086
         shr cx,1                        ; pairs, CF = odd char (fix 120:
         jnc @@pe                        ; two per iteration - the 77-char
-        lodsb                           ; @@full case was paired already);
-        stosw                           ; the odd char goes first
+        lodsb                           ; odd char goes first
+        stosw
 @@pe:   jcxz @@pd                       ; a 1-char line: no pairs
-@@pp:   lodsb
-        stosw
-        lodsb
-        stosw
+@@pp:   lodsw                           ; c1 -> AL, c2 -> AH
+        mov bl,ah                       ; c2 waits in BL
+        mov ah,bh                       ; the attribute joins c1
+        stosw                           ; cell 1
+        mov al,bl
+        stosw                           ; cell 2 (AH still ATTR_CONT)
         if USE386
         dec cx                          ; fix 134: DEC/JNZ on -3 - LOOP is
         jnz @@pp                        ; 11 cycles taken on a 386, the
@@ -2603,12 +2705,15 @@ WrCntRow proc
 @@pd:   pop cx                          ; pad the rest (CX=0: no-op)
         mov al,' '                      ; AH already carries ATTR_CONT
         rep stosw
+        pop bx
         ret
 @@full: add si,hPos                     ; window start: one ADD, no walk
         mov cx,38                       ; 38 pairs + the 77th char: no
-@@p:    lodsb                           ; NUL probes - the length byte
-        stosw                           ; already proved these 77 chars
-        lodsb                           ; are data (fix 99)
+@@p:    lodsw                           ; NUL probes - the length byte
+        mov bl,ah                       ; already proved these 77 chars
+        mov ah,bh                       ; are data (fix 99)
+        stosw
+        mov al,bl
         stosw
         if USE386
         dec cx                          ; fix 134: DEC/JNZ on -3 (LOOP is
@@ -2618,6 +2723,7 @@ WrCntRow proc
         endif
         lodsb                           ; the 77th char
         stosw
+        pop bx
         ret
 @@pad:  mov ax,A_CONT or ' '            ; the whole row is padding
         mov cx,LINEWID
@@ -2847,7 +2953,8 @@ RdLine proc uses bx cx dx si di bp
         shr ax,2                        ; AX = dwords of this round (fix
         mov cx,ax                       ; 80: a dword without CR/LF stores
 @@sw:   lodsd                           ; its 4 characters with ONE STOSD,
-        mov edx,eax                     ; ~10.5 instead of ~23 cycles/byte
+        mov ebp,eax                     ; fix 142: the dword stays in EBP -
+        mov edx,eax                     ; BP's flag is read only at the @@fx
         xor eax,0A0A0A0Ah               ; on the 386 - this is the parse
         xor edx,0D0D0D0Dh               ; that PgDn/PgUp and the no-cache
         and eax,edx                     ; repaints pay 23 times per page.
@@ -2856,7 +2963,7 @@ RdLine proc uses bx cx dx si di bp
         and eax,edx                     ; move, so (cand-1)&~cand costs 3
         test eax,80808080h             ; ops, not 4 (TEST doubles as the
         jnz @@swh                       ; mask: EAX is dead past the branch)
-        mov eax,[si-4]                  ; before @@dones). The 0-3
+        mov eax,ebp                     ; before @@dones). The 0-3
         stosd                           ; residue bytes re-round through
 @@swn:  dec cx                          ; @@sloop, which enters @@swr:
         jnz @@sw                        ; fix 134: DEC/JNZ, not LOOP - LOOP
@@ -2915,9 +3022,9 @@ RdLine proc uses bx cx dx si di bp
         cmp byte ptr [si],10
         je @@cr4e                       ; CRLF: eat it (canonical)
         jmp @@lfx                       ; CR only (canonical)
-@@c1:   cmp byte ptr [si-1],10          ; P1 CR: P2 is already loaded
-        je @@lfx                        ; CRLF: both consumed
-        jmp @@decf                      ; CR only: P2 opens the next line
+@@c1:   cmp ah,10                       ; P1 CR: P2 is ALREADY IN AH (fix
+        je @@lfx                        ; 141: the [si-1] reload cost ~13
+        jmp @@decf                      ; cycles per CRLF line for nothing)
 @@l1:   jmp @@decf                      ; P1 LF: P2 opens the next line
 @@c2:   cmp si,bx                       ; P2 CR: peek the next byte
         jae @@crhi                      ; block edge / EOF: GetByte
@@ -3084,12 +3191,6 @@ RdLine proc uses bx cx dx si di bp
         sub ax,offset bBuf
         mov bIdx,ax
         ; fall through
-@@eof:                                  ; EOF from @@refill: bIdx=0 there,
-                                        ; DX=0 forced by the refill branch
-                                        ; below (fix 107: the 386 SWAR
-                                        ; rounds leave garbage in DX and
-                                        ; the old "or dx,dx" then reported
-                                        ; a phantom line at true EOF)
 @@dones:                                ; slow exit: bIdx is already exact
         mov byte ptr [di],0
         mov ax,di                        ; the slot's length byte (66):
@@ -3122,12 +3223,9 @@ RdLine proc uses bx cx dx si di bp
 @@ret0: pop es                          ; restore the caller's ES (60)
         ret
 @@refill:
-        mov ax,si
-        sub ax,offset bBuf
-        mov bIdx,ax                     ; consumed bytes of the old block
-        mov ax,bLen
-        add word ptr bBase,ax
-        adc word ptr bBase+2,0
+        mov ax,bLen                     ; fix 144: the bIdx sync here was
+        add word ptr bBase,ax           ; dead - FillBuf always writes
+        adc word ptr bBase+2,0          ; bIdx=0 and both continuations
         call FillBuf                    ; file pointer == bBase (fix 42)
         or ax,ax
         jnz @@rfin                      ; more data: resume the scan
@@ -3756,10 +3854,9 @@ U2A proc uses bx cx dx si
         mov ax,bx
         or ax,ax
         jnz @@d
-@@o:    pop dx
-        add dl,'0'
-        mov al,dl
-        stosb
+@@o:    pop ax                          ; fix 148: the digits are pushed
+        add al,'0'                      ; with AH=0 - one pop feeds the
+        stosb                           ; digit straight into the string
         loop @@o
         ret
 U2A endp
@@ -3913,7 +4010,7 @@ idleCnt         db 0                    ; idle-pass counter (fix 81); it
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW23>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW24>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; the cut
                                         ; step retired by fix 115)
 BSSBASE         equ $                  ; RAM base: first byte past the image
@@ -3933,4 +4030,4 @@ vCache          equ popSave+HLP_H*WWIN*2       ; RSLOTS*SLOTSZ (63/85):
 vPos            equ vCache+RSLOTS*SLOTSZ       ; VPOSN*4 (64)
 tBuf            equ vPos+VPOSN*4               ; 128 bytes (30)
 BMEMTOP         equ tBuf+128           ; last RAM byte the program owns
-end
+end
