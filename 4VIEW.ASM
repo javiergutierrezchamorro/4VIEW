@@ -1,6 +1,23 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 1.34 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 1.35 - Turbo Vision style text viewer for DOS (ASMC)
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
+; Revision 1.35 changes (171; the keyboard feels faster):
+;  171. KEYBOARD TYPEMATIC SET TO MAXIMUM on AT+ (30 cps, 250 ms delay).
+;       The IBM AT BIOS default is ~10 cps with 500 ms delay: a held
+;       Down key scrolls only 10 lines/second, and the first auto-
+;       repeat does not fire until 500 ms after the press - on a 10.000-
+;       line file scrolling to the end takes ~16 seconds of holding.
+;       INT 16h AX=0305h BL=00 sets 30 cps with 250 ms: held keys scroll
+;       3x faster (30 lines/sec) and the repeat starts in half the time
+;       (~8 seconds for the same file). The AT keyboard BIOS (INT 16h
+;       AH=03h) is available on AT (286+) and later; PC/XT is detected
+;       via INT 15h AH=0C0h (system config: model byte >= 0FDh =
+;       PCjr/XT/PC) and left alone. Done restores the IBM AT default
+;       (BL=22h: 500 ms, ~10 cps). ~30 bytes, both builds; the INT 16h
+;       call is a safe no-op on machines without the AT keyboard BIOS.
+;       Version 1.35; the image stamp is "<4VIEW35>". SMART.INC stays
+;       at v2.43.
+;
 ; Revision 1.34 changes (168-170; the ESC-abort fix, the 386 U2A and the
 ; running line count - a review pass found three improvements):
 ;  168. ESC NOW REALLY ABORTS THE LOAD (fix 162 was dead code). FillBuf's
@@ -1566,8 +1583,8 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
 .code
 org 100h
 
-VERMAJ      equ 1                       ; product version 1.34
-VMIN        equ 34
+VERMAJ      equ 1                       ; product version 1.35
+VMIN        equ 35
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -1879,6 +1896,33 @@ Init proc
         mov cx,ax                       ; clears 23 slots, not 46 - no read
         xor ax,ax                       ; exists below the ring) - AX = 0:
         BLKFIL                          ; the wide clear
+
+        ; fix 171: accelerate keyboard typematic on AT+ (30 cps,
+        ; 250 ms delay) for faster Up/Down/PgUp/PgDn scroll. The IBM
+        ; AT default is ~10 cps with 500 ms: held keys scroll only 10
+        ; lines/second and the first repeat takes 500 ms. INT 16h
+        ; AX=0305h BL=00 sets 30 cps / 250 ms - 3x faster repeat and
+        ; half the initial delay. PC/XT is detected via INT 15h
+        ; AH=0C0h (system config: model byte >= 0FDh = PCjr/XT/PC)
+        ; and left alone; Done restores the IBM default (BL=22h).
+        mov svType,0                  ; assume no typematic change
+        push es
+        mov ax,0C00h                  ; INT 15h AH=0Ch: get system config
+        int 15h
+        jnc @@atk_chk                 ; CF=0: AT+, check model byte
+        pop es                        ; PC/XT: function not supported
+        jmp @@atk_done
+@@atk_chk:
+        mov al,byte ptr es:[bx]       ; model byte (0FCh=AT, 0FBh=XT/286,
+        pop es                        ; 0FAh..0F8h=PS/2 - all AT kbd)
+        cmp al,0FDh                   ; >= 0FDh: PCjr/XT/PC (no AT kbd)
+        jae @@atk_done
+        ; AT+ detected: set typematic to maximum speed
+        mov svType,1                  ; remember to restore on exit
+        mov ax,0305h                  ; INT 16h AH=03h AL=05h: set rate
+        xor bl,bl                     ; BL=0: 30 cps, 250 ms delay
+        int 16h
+@@atk_done:
 
         ; validate the video mode (BIOS data 0040:0049) and pick the
         ; video segment in the same pass: B000h for mono (mode 7),
@@ -4364,6 +4408,12 @@ Done proc
         mov bh,svPage
         mov dx,svCurs
         int 10h                         ; original cursor position
+        ; fix 171: restore typematic rate to IBM AT default
+        .if (svType)
+                mov ax,0305h          ; INT 16h AH=03h AL=05h
+                mov bl,22h            ; 500 ms delay, ~10 cps (AT default)
+                int 16h
+        .endif
         .if (hFile)
                 mov bx,hFile
                 mov ah,3Eh
@@ -4549,6 +4599,8 @@ svMode          db 0                    ; video mode at entry (fix 71)
 svForced        db 0                    ; Init forced mode 3 (fix 71)
 svShape         dw 0
 svCurs          dw 0
+svType          db 0            ; fix 171: typematic rate changed,
+                                ; restore on exit (AT+ only)
 sSTDIN          db "STDIN",0
 if USE386
 sHdr1           db "4VIEW386 ",'0'+VERMAJ,".",'0'+VMIN/10,'0'+VMIN mod 10," - ",0
@@ -4633,7 +4685,7 @@ idleCnt         db 0                    ; idle-pass counter (fix 81); it
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW34>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW35>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; the cut
                                         ; step retired by fix 115)
 BSSBASE         equ $                  ; RAM base: first byte past the image
