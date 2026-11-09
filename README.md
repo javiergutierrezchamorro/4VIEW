@@ -19,6 +19,8 @@ Classic Turbo Vision look:
 - Vertical scrollbar
 - Mouse + wheel support
 
+As compared with iconic LIST.COM by Vernon D. Buerg, even if 4VIEW/4VIEW386 is not so complete, it is 8 times smaller, open source and free.
+
 ## Features
 
 - COM file of less than 4 KB

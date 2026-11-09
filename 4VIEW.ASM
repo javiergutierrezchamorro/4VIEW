@@ -1,6 +1,196 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 1.27 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 1.33 - Turbo Vision style text viewer for DOS (ASMC)
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
+; Revision 1.33 fixes (167; the 100% state no longer wrecks the screen):
+;  167. THE BAR'S LAST REFILLS WIPED THE SCREEN AND FROZE THE VIEWER:
+;       fix 166's pos clamp DESTROYED the copy it was about to shift:
+;       "sub ax,progSize / sbb dx,progSize+2 / jb @@posok" left DX:AX
+;       holding the WRAPPED DIFFERENCE (curPos-progSize) on the keep
+;       path - the branch every honest refill takes, since curPos <
+;       progSize mid-file - and the normalization shift then scaled
+;       THAT. The quotient climbed past 20 as curPos neared the end
+;       (measured on the real 386 COM: 21 cells at 98.4% of a 30 MB
+;       file), "mov cx,20 / sub cx,si" wrapped to 0FFFFh and the
+;       empty-rail REP STOSW swept 131 KB across the video segment
+;       (B800:0FA0 forward, wrapping twice): the whole screen became
+;       the A_STAT mid-shade dither - the reported uniform teal - with
+;       only the just-painted filled cells surviving as the black block
+;       at columns 59-78 of the status row. The last ~130 refills kept
+;       repainting the same wreck (the load's tail reads as a hang at
+;       3300 cycles/ms) and the header row, never repainted after
+;       Init, stayed wiped for good. The clamp now runs AFTER the
+;       shift, where one unsigned 16-bit compare does it: pos16 =
+;       curPos>>SI is clamped against BX = progSize>>SI (min(a,b)>>s =
+;       min(a>>s,b>>s), so the quotient is untouched for pos <= size
+;       and exactly 20 past it; curPos itself stays read-only).
+;       THE ESTIMATOR'S DIV GUARD WAS ALSO INVERTED (166): "jb @@avok"
+;       jumped to the saturated path when DX < CX - the one case where
+;       the division is SAFE - and fell into the DIV when DX >= CX,
+;       the exact #DE case. For every real file the average was forced
+;       to 0FFFFh, the estimate stayed above progSize and the 166
+;       rescale never engaged at all (files whose lines average 64 KB+
+;       took the #DE instead). jae restores the intent: the running
+;       average divides while it fits a 16-bit quotient and saturates
+;       only when it would not. Verified by the Unicorn emulation of
+;       the real 386 COM - the 30 MB non-saturating file that wiped at
+;       98.4% now sweeps 0..20 with the screen intact; the 30 MB
+;       saturating file finally gets the rescaled denominator (progSize
+;       shrinks to 65.535*avg once totLines hits 256) and its bar
+;       spans the ~4.2 MB the scan really reads; the 72 KB-line file
+;       divides without #DE; 300 KB and 200 KB regressions stay clean -
+;       plus the listing diff of both COMs. Version 1.33. SMART.INC
+;       stays at v2.43.
+;
+; Revision 1.32 fixes (166; the bar spans the scan's REAL work):
+;  166. THE BAR CRAWLED, THEN JUMPED: with the 65.535-line saturation
+;       (fix 10) a 30 MB text file's scan covers only ~13% of the
+;       bytes, so the byte-based bar could reach just 2 of its 20
+;       cells before the load ended - the fix-165 beat made the final
+;       20/20 state visible, but the 2-to-20 jump stayed abrupt ("it
+;       fills one cell, fills the other, then all of them"). The bar's
+;       DENOMINATOR now rescales: once totLines crosses EST_AT (256)
+;       lines, the running average (curPos/totLines, 32/16 DIV with a
+;       #DE guard) estimates where the saturation will stop the scan
+;       (est = 65.535 * avg, one 16x16 MUL) and progSize SHRINKS to
+;       it - min(est, progSize), so the bar can only speed up, never
+;       jump back. The sweep then spans the ~4 MB the load really
+;       reads and completes at 20/20 without a jump. When the scan
+;       outgrows the estimate (heterogeneous line lengths), curPos is
+;       clamped to progSize BEFORE the normalization shift - a
+;       register copy, curPos stays read-only - so the quotient stays
+;       exact (<= 20) instead of wrapping out of the 16-bit window.
+;       One shot per load (estDone), invisible at the trigger (both
+;       denominators still paint ~0 cells there), free in STDIN mode
+;       (progSize = 0 exits before it), and it composes with the 165
+;       beat: an estimate miss that still stalls the bar below 15
+;       cells keeps its completion hold. ~55 bytes + 1 data byte; the
+;       per-refill cost is one byte test (estDone). Verified by the
+;       refill-by-refill bar timeline for 5 line lengths (the jump is
+;       gone: in every stationary case the last refills paint 19-20
+;       cells), a 100.000-case random quotient sweep with the clamp
+;       (always 0..20, no #DE, no MUL overflow), the 64 KB-line guard
+;       case (DX >= CX) and the listing diff of both COMs. Version
+;       1.32. SMART.INC stays at v2.43.
+;
+; Revision 1.31 fixes (165; the completion hold actually fires):
+;  165. THE FIX-164 HOLD WAS DEAD CODE: its condition read barCells
+;       AFTER the final paint - which had just overwritten the last
+;       refill's count with exactly 20 - so "below 15" was never true
+;       and the hold never ran: the bar still vanished from its last
+;       sweep value (2 cells on the reported 30 MB file), 1.30 behaved
+;       exactly like 1.29. The count is now SNAPPED into BL before the
+;       final ShowProg (whose uses-list keeps BL alive across the
+;       call) and the hold tests the snapshot: it fires exactly when
+;       the sweep stopped below 15 cells. The beat is widened to 8
+;       ticks (~440 ms) so the jump to the full bar is unambiguous.
+;       Verified by an instruction-faithful trace of both tails (the
+;       1.30 order holds 0 of the 6 traced scenarios - the proof of
+;       the bug - the 1.31 order holds exactly the sub-75% ones), by
+;       the re-run of the 1..4 GiB-1 quotient sweep (final paint =
+;       exactly 20, no MUL overflow, no #DE) and by the listing diff
+;       of both COM images. Version 1.31. SMART.INC stays at v2.43.
+;
+; Revision 1.30 fixes (164; the completed bar becomes perceptible):
+;  164. THE COMPLETED BAR WAS INVISIBLE: fix 163 painted the final
+;       20/20 cells, but that paint lasted only the microseconds DrwSt
+;       needs to reach the status repaint - on the saturating case
+;       (fix 10's 65.535-line early exit stops a 30 MB text scan ~13%
+;       in, so the bar's honest sweep ends at 2 cells) the bar seemed
+;       to vanish from 2 cells, "as if the load never finished". The
+;       completion now gets a hold: ShowProg leaves its filled-cell
+;       count in barCells, and CountLines - right after the final
+;       paint - freezes ~6 BIOS ticks (~330 ms) when the last refill's
+;       bar sat below 15 cells (75%): the jump to the full bar is the
+;       visible "load done" beat exactly where the sweep stopped far
+;       from it. Loads whose sweep reached 19-20 cells (any file over
+;       ~640 KB) keep ending at full speed: the near-full bar was
+;       already on screen for the whole last 32 KiB block. An ESC-
+;       aborted scan holds too - the beat delays Done by ~330 ms,
+;       harmless. The wait polls the BIOS tick word at 0:046Ch for 6
+;       EDGES (wrap-safe, no DOS call; AX/SI are dead there), ~30
+;       bytes both builds. Version 1.30. SMART.INC stays at v2.43.
+;
+; Revision 1.29 fixes (163; the load bar completes its sweep):
+;  163. THE PROGRESS BAR NEVER PAINTED 100%: ShowProg repaints at every
+;       FillBuf refill from curPos, but curPos is materialized ONCE PER
+;       LINE (RdLine's @@dones), so the last paint always ran behind the
+;       reads - and CountLines retired progSize without painting again.
+;       Two freezes, both hit by a 30 MB text file:
+;       - the scan SATURATES at line 65.535 (fix 10) and breaks out
+;         MID-FILE: 65.535 lines of ~60 bytes is ~4 MB, so the bar froze
+;         at ~13% of 20 cells and the load ended right there;
+;       - a file whose last line lacks the trailing CRLF hits the EOF
+;         refill mid-line, whose paint ran with the STALE line-start
+;         curPos (~95%): only files ending in CRLF flashed 100%, by
+;         luck of their refill falling between lines.
+;       The fix is five instructions in CountLines: after the scan loop
+;       curPos is forced to progSize and ShowProg runs ONE more time -
+;       the quotient is exactly 20/20 cells whether the scan reached
+;       the EOF or saturated mid-file; progSize is retired right after
+;       and the existing curPos=0 reset follows, so nothing else moves.
+;       An ESC-aborted scan flashes its forced 100% for the few
+;       instructions before Done restores the screen. ~100 cycles once
+;       per load, both builds.
+;       Version 1.29. SMART.INC stays at v2.43.
+;
+; Revision 1.28 fixes (160-162; the follow-up performance pass - real
+; and perceived. A full re-read of the 1.27 source; both builds
+; re-assembled with ASMC and the COM images diffed against 1.27: the
+; only diffs are the intended instructions, the version digits and
+; the @Time stamp of the About box. The scanner state machine is
+; untouched, so the fix-155 simulator (scripts/sim_store386_127.py)
+; stays authoritative for the store/consume semantics):
+;  160. THE -3 SCANNERS AND PAINT LOOPS STOP PAYING THE MICROCODED
+;       STRING-OP TOLL: on a 386 LODSD costs ~12 cycles and STOSD ~11
+;       (LODSB/STOSB the same) while MOV EAX,[SI] is 4 and MOV [DI],r
+;       is 4 - the single (non-REP) string forms only pay off when REP
+;       amortizes them, and none of these sites is REP. The four hot
+;       sites move to MOV + pointer-add, 8086 code untouched:
+;       - the count scan's LODSD (fix 79) becomes MOV EAX,[SI]/ADD
+;         SI,4: ~1.5 cycles/byte less on the ~7.5 of the pre-scan that
+;         IS the load pass (~20% off it);
+;       - the store scan's LODSD + "mov eax,ebp"/STOSD (fixes 80/142)
+;         become MOV EAX,[SI]/ADD SI,4 and MOV [DI],EBP/ADD DI,4: ~13
+;         cycles less per stored dword on the parse PgDn/PgUp pay 23
+;         times per page (the fix 142 park stays - the dword now
+;         stores straight from EBP, the EAX feed is gone);
+;       - the candidate re-scan tails (@@sr/@@dr) swap LODSB/STOSB for
+;         MOV/INC: 6+6 instead of 12+11 per re-scanned byte (the
+;         TAB-heavy lines);
+;       - WrCntRow's two pair loops swap LODSW (12->6) and both STOSW
+;         (11->5+2, ES override) on -3: ~14 cycles less per pair on
+;         every painted row.
+;  161. THE 8086 PAIR LOADS GO THROUGH MOV: LODSW is 16 cycles on an
+;       8086, MOV AX,[SI] is 10 (8+EA 2) and ADD SI,2 is 4 - 2 cycles
+;       less per pair. Applied to the four LODSW of the count scan's
+;       8-byte unroll (the load pass: ~1 cycle/byte off the ~22 of fix
+;       67), the store scanner's pair loop (fix 60's ~44.5/byte path;
+;       the STOSB stores STAY: 11 beats MOV [DI],AL+INC DI 16, fix
+;       60's own measurement) and WrCntRow's pair loops (shared code,
+;       both builds win). The candidate contract is untouched: MOV
+;       AX,[SI] leaves AL/AH and SI exactly where LODSW did (the @@c1
+;       handler still finds P2 in AH, fix 141). The byte tails keep
+;       LODSB everywhere: 12 beats 10+3 there.
+;  162. ESC INTERRUPTS THE LOAD: the pre-scan is the one stretch where
+;       4VIEW ignores the keyboard (an 8088 needs ~1.8 s for 385 KB;
+;       fixes 70/86/156 made the wait visible and painted the first
+;       view early, but ESC stayed queued until the WHOLE scan ended).
+;       FillBuf now peeks the BIOS ring once per 32 KiB refill (zero
+;       per-line cost) and, ONLY while the load pass runs (progSize
+;       != 0 - fix 86's exact lifetime), a PENDING ESC - never
+;       consumed - makes the refill report 0 bytes: RdLine unwinds
+;       through its normal EOF exit, CountLines closes with the lines
+;       counted so far, the first Draw paints the captured view and
+;       Main's loop finds the untouched ESC and quits through the
+;       normal path (Done restores the screen). The fake EOF is
+;       unobservable: nothing can rely on the truncated totLines
+;       before the queued ESC quits, a typed-ahead non-ESC key keeps
+;       waiting, and the viewing refills (GoLine, cold fills, the
+;       ScrUp rescan) are gated out by the progSize test. ~45 bytes
+;       and ~100 cycles per block on both builds.
+;       Version 1.28; the image stamp is "<4VIEW28>". SMART.INC stays
+;       at v2.43.
+;
 ; Revision 1.27 fixes (155-159; a full read of the 1.26 source plus a
 ; source-level Python re-simulation of the 386 store scanner over
 ; block-straddling corpora - scripts/sim_store386_127.py, the same
@@ -1335,8 +1525,8 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
 .code
 org 100h
 
-VERMAJ      equ 1                       ; product version 1.27
-VMIN        equ 27
+VERMAJ      equ 1                       ; product version 1.33
+VMIN        equ 33
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -1354,6 +1544,9 @@ LBUFCAP     equ 254                     ; chars kept per line: the 256-byte
 HPOSMAX     equ LBUFCAP-LINEWID         ; last useful horizontal window
                                         ; (177 < 256: WrCntRow compares
                                         ; hPos's low byte, fix 66)
+EST_AT      equ 256                     ; lines read before ShowProg's
+                                        ; running average rescales the
+                                        ; bar's denominator (fix 166)
 RSLOTS      equ 46                      ; merged view-buffer slots (85):
                                         ; slots 0..22 are the file view
                                         ; cache, all 46 form the STDIN
@@ -1876,19 +2069,61 @@ StatLoad endp
 ; status bar, filled = curPos*20/progSize. progSize and curPos are
 ; normalized by the same right shift first (size>>SI, pos>>SI), so the
 ; 16-bit MUL/DIV cannot overflow at any file size up to 4 GiB-1 and
-; the quotient still lands in 0..20. Painted empty by Init when the
+; the quotient still lands in 0..20 (curPos past a rescaled progSize
+; is clamped to the SHIFTED size AFTER the shift - one unsigned
+; compare, curPos stays read-only, fix 167: 1.32's pre-shift clamp
+; shifted its own sub result on the keep path and the repaint swept
+; the video segment). ONCE totLines
+; crosses EST_AT lines, the running byte average predicts where the
+; 65.535-line saturation will stop the scan and progSize SHRINKS to
+; that estimate (166): the sweep then spans the work the load really
+; does - the 30 MB file that crawled to 2 cells and jumped now fills
+; smoothly across its ~4 MB scan. One shot per load, only ever
+; shrinks (the bar may speed up, never jump back). Painted empty by
+; Init when the
 ; load starts and by every FillBuf while the pre-scan runs - one
 ; repaint per 32 KiB block (118: 12 repaints on a 385 KB file), ~80
 ; cycles each on an 8086; CountLines
-; clears progSize when the scan ends, so later refills (GoLine, cold
-; Downs at a block edge) paint nothing. Everything is in the uses
+; paints the LAST one itself (curPos forced to the size: exactly 20
+; cells, fix 163) and then clears progSize, so later refills (GoLine,
+; cold Downs at a block edge) paint nothing. Every paint leaves its
+; filled-cell count in barCells (164: the completion hold's input).
+; Everything is in the uses
 ; list or saved explicitly: the FillBuf callers hold SI/DI live.
 ;------------------------------------------------------------------------------
 ShowProg proc uses ax bx cx dx si di
         mov ax,word ptr progSize
         or ax,word ptr progSize+2      ; zero: no bar to paint
         jz @@done
-        push es
+        ; the denominator rescale (166): predict the scan's end from
+        ; the running average and shrink progSize to it - the byte bar
+        ; cannot show a saturating scan honestly otherwise (10+165)
+        cmp estDone,0
+        jne @@estd
+        cmp totLines,EST_AT
+        jb @@estd
+        mov estDone,1                  ; one shot: even a no-shrink
+                                        ; estimate is never re-run
+        mov cx,totLines                ; the REAL count at this refill
+        mov ax,word ptr curPos
+        mov dx,word ptr curPos+2
+        cmp dx,cx                      ; DX >= CX: the DIV would #DE
+        jae @@avok                     ; (avg >= 64 KB per line: est -
+        div cx                         ; 167: 1.32's jb was inverted and
+        jmp @@estmul                   ; divided the #DE case itself)
+@@avok: mov ax,0FFFFh                   ; avg saturated: the size test
+@@estmul:                               ; below keeps the bar as is
+        mov cx,0FFFFh                  ; the scan stops at line 65.535
+        mul cx                         ; DX:AX = est (max FFFE0001h)
+        cmp dx,word ptr progSize+2     ; only ever SHRINKS progSize
+        ja @@estd                      ; (the bar may speed up, never
+        jb @@estset                    ; jump back)
+        cmp ax,word ptr progSize
+        jae @@estd
+@@estset:
+        mov word ptr progSize,ax
+        mov word ptr progSize+2,dx
+@@estd: push es
         xor si,si                      ; the normalization shift
         mov dx,word ptr progSize+2
         mov ax,word ptr progSize
@@ -1906,9 +2141,23 @@ ShowProg proc uses ax bx cx dx si di
                 rcr ax,1
                 dec cx
         .endw
+        cmp ax,bx                      ; the rescale can leave curPos
+        jbe @@nok                      ; PAST progSize (the scan outgrew
+        mov ax,bx                      ; the estimate): clamp the SHIFTED
+@@nok:                                  ; copy to the shifted size (167) -
+                                        ; min(a,b)>>s = min(a>>s,b>>s), so
+                                        ; the quotient is untouched for
+                                        ; pos <= size and exactly 20 past
+                                        ; it. 1.32 clamped BEFORE the shift
+                                        ; with a sub/sbb whose keep path
+                                        ; shifted the wrapped DIFFERENCE,
+                                        ; not curPos: the quotient left
+                                        ; 0..20 and the rail's rep stosw
+                                        ; swept the video segment
         mov si,20
         mul si                         ; DX:AX = pos16*20
         div bx                         ; AX = filled cells, 0..20
+        mov barCells,al                ; the hold's decision input (164)
         mov si,ax
         mov cx,ax
         mov es,vSeg
@@ -1998,8 +2247,19 @@ SeekSoft endp
 ; trailing line without EOL still counts exactly: at EOF the scan
 ; compares curPos with the saved line start (tmpPos), which the
 ; no-store mode would leave in an empty lBuf. The progress bar (fix
-; 86) is retired here: progSize is cleared so later FillBuf refills
-; (GoLine, cold Downs at a block edge) paint nothing.
+; 86) ends here: curPos is forced to the file size and ShowProg runs
+; ONE last time - the sweep closes at exactly 20/20 cells whether the
+; scan reached the EOF or saturated at line 65.535 mid-file (fix 163:
+; the last refill's paint ran with the previous line's curPos, so the
+; 100% state was never painted) - and THEN progSize is cleared so
+; later FillBuf refills (GoLine, cold Downs at a block edge) paint
+; nothing. When the LAST refill's bar (snapped into BL before the
+; final paint, fix 165 - barCells reads 20 after it) sat below 15
+; cells - the saturating case ends at 2 cells on a 30 MB file - the
+; full bar is HELD for ~8 BIOS ticks (~440 ms, fixes 164/165): the
+; jump to 20/20 is the perceptible "load done" beat before DrwSt
+; wipes the row. Sweeps that already reached 15+ cells (any file
+; over ~128 KB) needed no beat and keep the fast exit.
 ;------------------------------------------------------------------------------
 CountLines proc
         mov totLines,0
@@ -2066,7 +2326,29 @@ CountLines proc
                         .break
                 .endif
         .endw
-        mov cntMode,0
+        mov bl,barCells                 ; the LAST refill's count (165):
+                                        ; snap it BEFORE the final paint,
+                                        ; which overwrites barCells with
+                                        ; exactly 20 - the 1.30 hold read
+                                        ; it after and never fired
+        mov ax,word ptr progSize        ; the bar closes at 100% (163):
+        mov word ptr curPos,ax          ; curPos = size - the last paint
+        mov ax,word ptr progSize+2      ; inside FillBuf ran with the
+        mov word ptr curPos+2,ax        ; previous line's curPos, and a
+        call ShowProg                   ; saturated scan left it mid-file
+        cmp bl,15                       ; the completion must be SEEN
+        jae @@nob                       ; (164/165): a sweep that stop-
+        push ds                         ; ped below 15 cells - the satu-
+        xor ax,ax                       ; rating 30 MB file freezes at 2
+        mov ds,ax                       ; - holds the full bar for 8 tick
+        mov si,8                        ; edges (~440 ms) before DrwSt
+@@tick: mov ax,ds:[046Ch]              ; wipes it. A sweep that reached
+@@edge: cmp ax,ds:[046Ch]              ; 15+ cells (any file over ~128
+        je @@edge                       ; KB) showed a near-full bar for
+        dec si                          ; its whole last block: no beat,
+        jnz @@tick                      ; the fast exit stays
+        pop ds
+@@nob:  mov cntMode,0
         mov wDest,offset lBuf           ; safety: never leave a slot armed
         xor ax,ax
         mov word ptr progSize,ax        ; retire the progress bar (86)
@@ -2858,16 +3140,22 @@ WrCntRow proc
         lodsb                           ; odd char goes first
         stosw
 @@pe:   jcxz @@pd                       ; a 1-char line: no pairs
-@@pp:   lodsw                           ; c1 -> AL, c2 -> AH
-        mov bl,ah                       ; c2 waits in BL
+@@pp:   mov ax,[si]                     ; fix 161: 14 vs LODSW 16 on an
+        add si,2                        ; 8086 (6 vs ~12 on -3): c1 -> AL,
+        mov bl,ah                       ; c2 -> AH, it waits in BL
         mov ah,bh                       ; the attribute joins c1
-        stosw                           ; cell 1
-        mov al,bl
-        stosw                           ; cell 2 (AH still ATTR_CONT)
         if USE386
+        mov es:[di],ax                  ; fix 160: 5+2 vs STOSW ~11/cell
+        add di,2
+        mov al,bl
+        mov es:[di],ax
+        add di,2                        ; cell 2 (AH still ATTR_CONT)
         dec cx                          ; fix 134: DEC/JNZ on -3 - LOOP is
         jnz @@pp                        ; 11 cycles taken on a 386, the
         else                            ; pair is 9 (and worse on 486+)
+        stosw                           ; cell 1
+        mov al,bl
+        stosw                           ; cell 2 (AH still ATTR_CONT)
         loop @@pp
         endif
 @@pd:   pop cx                          ; pad the rest (CX=0: no-op)
@@ -2877,16 +3165,22 @@ WrCntRow proc
         ret
 @@full: add si,hPos                     ; window start: one ADD, no walk
         mov cx,38                       ; 38 pairs + the 77th char: no
-@@p:    lodsw                           ; NUL probes - the length byte
-        mov bl,ah                       ; already proved these 77 chars
-        mov ah,bh                       ; are data (fix 99)
-        stosw
-        mov al,bl
-        stosw
+@@p:    mov ax,[si]                     ; fix 161: 14 vs LODSW 16 on an
+        add si,2                        ; 8086 (6 vs ~12 on -3). NUL probes
+        mov bl,ah                       ; - the length byte already proved
+        mov ah,bh                       ; these 77 chars are data (fix 99)
         if USE386
+        mov es:[di],ax                  ; fix 160: 5+2 vs STOSW ~11/cell
+        add di,2
+        mov al,bl
+        mov es:[di],ax
+        add di,2
         dec cx                          ; fix 134: DEC/JNZ on -3 (LOOP is
         jnz @@p                         ; 11 cycles taken on a 386)
         else
+        stosw
+        mov al,bl
+        stosw
         loop @@p
         endif
         lodsb                           ; the 77th char
@@ -2969,14 +3263,43 @@ GoLine endp
 ; right after the call (fix 106 - 1.15 returned progSize instead and
 ; the load hung). Keeps bx/cx/dx: RdLine's refill path holds the
 ; fetch cursor, the loop count and the exit flag across the call.
+; FIX 162: a refill that runs while the load pass is live (progSize
+; set, fix 86) peeks the BIOS keyboard ring first; a PENDING ESC
+; returns 0 bytes - the scan unwinds through the normal EOF exits
+; and the queued ESC quits via Main. The key is never consumed,
+; non-ESC keys change nothing, and refills outside the load pass
+; (progSize cleared by CountLines) never peek.
 FillBuf proc uses bx cx dx
         mov bx,hFile
         mov ah,3Fh
         mov dx,offset bBuf
         mov cx,BUFSZ
         int 21h
-        jnc @@ok                        ; CF=1: AX is an error code, not
+        jnc @@esc                       ; CF=1: AX is an error code, not
         xor ax,ax                       ; a byte count: treat it as EOF (112)
+        jmp @@ok
+@@esc:  or ax,ax
+        jz @@ok                         ; real EOF: nothing to peek at
+        mov cx,ax                       ; CX parks the read count (CX is
+        mov ax,word ptr progSize        ; dead here). fix 162: peek ONLY
+        or ax,word ptr progSize+2       ; during the load pass (86: progSize
+        jz @@rst                        ; is live exactly for the pre-scan)
+        push ds
+        xor ax,ax
+        mov ds,ax                       ; DS=0: the BIOS ring at 0:041Ah
+        mov bx,ds:[0041Ah]              ; head (fix 151's addressing)
+        cmp bx,ds:[0041Ch]              ; head == tail: the ring is empty
+        je @@pk1
+        mov ax,ds:[bx+0040h]            ; the queued keystroke word (the
+        cmp ax,011Bh                    ; key lives at 0040:[head]); ESC =
+        jne @@pk1                       ; AL=1Bh AH=01h = 011Bh
+        xor cx,cx                       ; ESC waits: THIS refill reads 0 -
+                                        ; RdLine unwinds through its normal
+                                        ; EOF exit and the untouched ESC
+                                        ; quits via Main right after the
+                                        ; first Draw (.case 01h -> Done)
+@@pk1:  pop ds
+@@rst:  mov ax,cx                       ; the read count (or the fake 0)
 @@ok:   mov bLen,ax
         mov bIdx,0
         push ax                         ; the read count IS the return
@@ -3122,19 +3445,25 @@ RdLine proc uses bx cx dx si di bp
         jb @@swr                        ; 1-3 bytes: the pairs path below
         shr ax,2                        ; AX = dwords of this round (fix
         mov cx,ax                       ; 80: a dword without CR/LF stores
-@@sw:   lodsd                           ; its 4 characters with ONE STOSD,
-        mov ebp,eax                     ; fix 142: the dword stays in EBP -
-        mov edx,eax                     ; BP's flag is read only at the @@fx
-        xor eax,0A0A0A0Ah               ; on the 386 - this is the parse
-        xor edx,0D0D0D0Dh               ; that PgDn/PgUp and the no-cache
+@@sw:   mov eax,[si]                    ; fix 160: MOV+ADD instead of LODSD
+        add si,4                        ; (~12 vs 4+2 on a 386). fix 142:
+        mov ebp,eax                     ; the dword stays in EBP - BP's
+        mov edx,eax                     ; flag is read only at the @@fx
+        xor eax,0A0A0A0Ah               ; entry - this is the parse that
+        xor edx,0D0D0D0Dh               ; PgDn/PgUp and the no-cache
         and eax,edx                     ; repaints pay 23 times per page.
         lea edx,[eax-01010101h]         ; fix 133: EDX = cand-1 while EAX
         not eax                         ; KEEPS cand - the NOT eats the copy
         and eax,edx                     ; move, so (cand-1)&~cand costs 3
         test eax,80808080h             ; ops, not 4 (TEST doubles as the
-        jnz @@swh                       ; mask: EAX is dead past the branch)
-        mov eax,ebp                     ; before @@dones). The 0-3
-        stosd                           ; residue bytes re-round through
+        jnz @@swh                       ; mask: EAX is dead past the branch
+        mov [di],ebp                    ; before @@dones). fix 160: the dword
+        add di,4                        ; stores STRAIGHT from EBP - one
+                                        ; STOSD was ~11 plus the fix 142 EAX
+                                        ; feed, the MOV form writes the same
+                                        ; 4 bytes in 4+2 (ES=DS: the same
+                                        ; memory). The 0-3 residue bytes
+                                        ; re-round through
 @@swn:  dec cx                          ; @@sloop, which enters @@swr:
         jnz @@sw                        ; fix 134: DEC/JNZ, not LOOP - LOOP
         xor bp,bp                       ; fix 155: the store flag back to 0
@@ -3157,12 +3486,14 @@ RdLine proc uses bx cx dx si di bp
                                         ; and the previous slot's length
                                         ; byte) and [wDest+255] wrapped
         mov dx,4
-@@sr:   lodsb
+@@sr:   mov al,[si]                     ; fix 160: 4+2 vs LODSB ~12
+        inc si
         cmp al,13
         je @@stc                        ; CR: shared peek exit
         cmp al,10
         je @@lfx                        ; LF: shared exit (canonical, 136)
-        stosb
+        mov [di],al                     ; fix 160: 4+2 vs STOSB ~11 (ES=DS)
+        inc di
         dec dx
         jnz @@sr
         jmp @@swn                       ; dword done: count it with CX
@@ -3171,7 +3502,9 @@ RdLine proc uses bx cx dx si di bp
         shr ax,1                        ; AX = words of this round
         mov cx,ax
         jcxz @@st                       ; one odd byte: tail check
-@@sp:   lodsw                           ; P1 = AL, P2 = AH
+@@sp:   mov ax,[si]                     ; fix 161: 10+4 = 14 on an 8086 vs
+        add si,2                        ; LODSW 16 (6 vs ~12 on -3);
+                                        ; P1 = AL, P2 = AH
         cmp al,13
         je @@c1
         cmp al,10
@@ -3219,7 +3552,8 @@ RdLine proc uses bx cx dx si di bp
         if USE386
         shr cx,2                        ; CX = dwords (fix 79: on the 386
         jz @@t4                         ; the scan reads LODSD and tests
-@@fw:   lodsd                           ; four bytes in parallel: cand =
+@@fw:   mov eax,[si]                    ; fix 160: 4+2 instead of LODSD ~12:
+        add si,4                        ; ~20% off the pre-scan. cand =
         mov edx,eax                     ; (v^0A0A0A0Ah)&(v^0D0D0D0Dh) has
         xor eax,0A0A0A0Ah               ; a zero byte exactly when the
         xor edx,0D0D0D0Dh               ; data byte lies in 08h..0Fh (a
@@ -3231,8 +3565,9 @@ RdLine proc uses bx cx dx si di bp
         jz @@fwn                        ; 4, and TEST doubles as the mask
         sub si,4                        ; ~10.6 cycles/byte: the pre-scan
         mov dx,4                        ; of a 385 KB file drops ~30% on
-@@dr:   lodsb                           ; a 386DX-25. DX is free here: no
-        sub al,10                       ; exit has run, it is still the
+@@dr:   mov al,[si]                     ; fix 160: 4+2 vs LODSB ~12 per
+        inc si                          ; re-scanned byte. DX is free here:
+        sub al,10                       ; no exit has run, it is still the
         cmp al,3                        ; entry 0 and every exit below
         ja @@drn                        ; writes it before @@dones.
         je @@cr4                        ; CR: the shared peek handler (fix
@@ -3250,28 +3585,32 @@ RdLine proc uses bx cx dx si di bp
                                         ; candidate handlers now live INSIDE
                                         ; the 8086 branch - 1.11 assembled
                                         ; them unreferenced on -3)
-@@f8:   lodsw                           ; P1 = AL, P2 = AH
+@@f8:   mov ax,[si]                     ; fix 161: 14 vs LODSW 16 per pair
+        add si,2                        ; (P1 = AL, P2 = AH)
         sub al,10
         cmp al,3                        ; P1 in 0Ah..0Dh?
         jbe @@candlo
         sub ah,10
         cmp ah,3                        ; P2 in 0Ah..0Dh?
         jbe @@candhi
-        lodsw                           ; P3/P4: the same pair contract
+        mov ax,[si]                     ; fix 161: 14 vs LODSW 16; P3/P4:
+        add si,2                        ; the same pair contract
         sub al,10                       ; (AL = P-10, AH = the partner
         cmp al,3                        ; byte, SI past the pair), so the
         jbe @@candlo                    ; shared @@candlo/@@candhi
         sub ah,10                       ; handlers serve all eight halves
         cmp ah,3
         jbe @@candhi
-        lodsw                           ; P5/P6
+        mov ax,[si]                     ; fix 161: 14 vs LODSW 16. P5/P6
+        add si,2
         sub al,10
         cmp al,3
         jbe @@candlo
         sub ah,10
         cmp ah,3
         jbe @@candhi
-        lodsw                           ; P7/P8
+        mov ax,[si]                     ; fix 161: 14 vs LODSW 16. P7/P8
+        add si,2
         sub al,10
         cmp al,3
         jbe @@candlo
@@ -4086,6 +4425,8 @@ hPos            dw 0                    ; horizontal window start (fix 47)
 rIdx            dw 0                    ; next STDIN ring slot (fixes 50/85)
 ringN           dw 0                    ; ring slots: 23 file / 46 STDIN (85)
 progSize        dd 0                    ; file size for the load bar (86)
+barCells        db 0                    ; ShowProg's last fill count (164)
+estDone         db 0                    ; the 166 rescale is one-shot
 cntMode         db 0                    ; RdLine consume-only pass (49)
 vSlot           db 0                    ; view cache: top row's slot (63)
 vcTop           dw 0                    ; view cache: top line number (63)
@@ -4189,7 +4530,7 @@ idleCnt         db 0                    ; idle-pass counter (fix 81); it
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW27>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW33>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; the cut
                                         ; step retired by fix 115)
 BSSBASE         equ $                  ; RAM base: first byte past the image
