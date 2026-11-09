@@ -11,7 +11,7 @@ Copyright (c) 2025-2026 Javier Gutiérrez Chamorro (Guti)
 
 ## Description
 
-Lightweight and ultrafast text file viewer written in 16-bit assembly. Displays text files of **any size** (does not load the whole file into RAM).
+4VIEW and 4VIEW386 are a lightweight and ultrafast text file viewer written in 16-bit and 32-bit assembly. Displays text files of **any size** (does not load the whole file into RAM).
 
 Classic Turbo Vision look:
 - Blue content area, white text
@@ -22,6 +22,7 @@ Classic Turbo Vision look:
 ## Features
 
 - COM file of less than 4 KB
+- Optional optimized 386+ version
 - Arbitrary file size support (streaming + seeking)
 - Exact line count (initial pass)
 - Recent-line offset cache → real scroll-up works with pipes
@@ -34,6 +35,7 @@ Classic Turbo Vision look:
 ## Requirements
 
 - DOS 2.0+ / FreeDOS / DOSBox
+- 8088 CPU or better (80386 or better for the 386 version)
 - 80×25 text mode
 - Optional mouse driver (CuteMouse recommended for wheel)
 - [SMART.INC](https://github.com/javiergutierrezchamorro/SMART.INC) macros (only to assemble, not to run)

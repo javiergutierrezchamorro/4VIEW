@@ -1,6 +1,36 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 1.25 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 1.26 - Turbo Vision style text viewer for DOS (ASMC)
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
+; Revision 1.26 fixes (152-154; the 1.25 audit - full read of the source
+; plus a numeric re-verification of the arithmetic blocks: U2A over the
+; whole 16-bit range, FastIMul for every constant -32768..65535 and
+; FastMul for the factors this code uses, both against a 32-bit
+; reference, zero failures; SMART.INC needs no change):
+;  152. FULLPATH'S LENGTH CLAMP WAS INVERTED: the "ja @@okl" aimed the
+;       65..128-char Truename results AT the copy (fName holds 65 bytes:
+;       CX up to 128 overran it into lBuf, and DrwHdr's "mov cx,160 /
+;       sub cx,di" row pad went NEGATIVE - shr cx,1 turned 0FF86h into
+;       ~32.700 words and the rep stosw swept the whole video segment
+;       the moment Init repainted the title after FullPath, both builds),
+;       while the 0..64-char paths were force-clamped UP to a fixed
+;       64-byte copy that only worked thanks to the embedded NUL. The
+;       jump now goes to @@keep: a path that does not fit keeps the name
+;       as typed (the documented behavior since 1.01), anything else
+;       copies its own length. 3 bytes less, and the fName/title/
+;       StatLoad layout contract holds by construction again.
+;  153. THE TWO SLOT-WRAP TESTS ARE UNSIGNED BY OPCODE: the ".if (bx >=
+;       offset vCache+LINES_VIS*SLOTSZ)" of DrwDn1's cold fill and
+;       DrwCnt's repaint only compared unsigned because 0CA07h does not
+;       fit SWORD (fix 149's exception to the signed-.if rule); explicit
+;       cmp/jb keeps the branch unsigned for ANY image layout at an
+;       identical byte count, joining the discipline of fixes 93/129/140.
+;  154. BLKCP'S EVEN-COUNT CONTRACT DOCUMENTED (zero code change): the
+;       copy runs MOVSW/MOVSD, so an odd CX would silently drop the tail
+;       byte; every call site passes an even count (4000 for the page
+;       save/restore, the popup rows, ringN*256 for the view buffer) and
+;       CpyN serves any-count copies. Version 1.26; the image stamp is
+;       "<4VIEW26>". SMART.INC stays at v2.43.
+;
 ; Revision 1.25 changes (151; the idle key poll - the hottest loop of the
 ; program, ~1900 passes per keypress (fix 81) - verified by assembling
 ; both builds with ASMC and diffing the COM images: the only diffs are
@@ -1229,8 +1259,8 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
 .code
 org 100h
 
-VERMAJ      equ 1                       ; product version 1.25
-VMIN        equ 25
+VERMAJ      equ 1                       ; product version 1.26
+VMIN        equ 26
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -1290,6 +1320,12 @@ HLP_H       equ HLP_N+4                 ; borders + one blank row top/bottom
 ; 386 build painted the desktop as blue/black vertical stripes (fix 40,
 ; the "Loading ..." screenshot). PUSH AX/PUSH AX/POP EAX duplicates the
 ; cell word into both halves without touching any other register.
+; FIX 154 (documentation, zero code change): BLKCP's count must be EVEN.
+; The copy runs MOVSW/MOVSD and an odd CX would silently drop the tail
+; byte. Every call site passes an even count (4000 for the page
+; save/restore, the popup rows are (bp+2)*2, ringN*256 for the view
+; buffer); CpyN is the any-count copy. Keep it in mind before reusing
+; the macro anywhere else.
 ;------------------------------------------------------------------------------
 BLKCP   macro
         if USE386
@@ -1694,9 +1730,22 @@ FullPath proc
         mov cx,di
         sub cx,offset tBuf+1            ; CX = path length
         cmp cx,64                       ; fName holds 64 chars + NUL:
-        ja @@okl                        ; UNSIGNED (fix 140: the 1.22
-        mov cx,64                       ; .if was SIGNED, fix 93)
-@@okl:
+        ja @@keep                       ; UNSIGNED (fix 140). FIX 152: the
+                                        ; 1.25 "ja @@okl" was inverted - it
+                                        ; aimed the >64-char paths AT the
+                                        ; copy, so CX up to 128 overran
+                                        ; fName into lBuf and DrwHdr's
+                                        ; "mov cx,160 / sub cx,di" pad
+                                        ; computed a NEGATIVE count whose
+                                        ; shr/rep stosw swept the whole
+                                        ; video segment the moment Init
+                                        ; repainted the title after this
+                                        ; call; the <=64 paths copied a
+                                        ; fixed 64 bytes that only worked
+                                        ; thanks to the embedded NUL.
+                                        ; Too long: keep the name as typed
+                                        ; (the documented 1.01 behavior),
+                                        ; 3 bytes less
         .if (cx)                        ; zero length: keep as typed
                 mov si,offset tBuf
                 mov di,offset fName
@@ -2611,9 +2660,13 @@ DrwDn1 proc
                         VPSTORE di              ; vPos: row i's start (64)
                         call RdLine
                         add bx,SLOTSZ
-                        .if (bx >= offset vCache+LINES_VIS*SLOTSZ)
-                                mov bx,offset vCache
-                        .endif
+                        cmp bx,offset vCache+LINES_VIS*SLOTSZ
+                        jb @@flc                 ; fix 153: UNSIGNED by
+                        mov bx,offset vCache     ; opcode - the .if only
+@@flc:                                          ; compared unsigned because
+                                                ; 0CA07h does not fit SWORD
+                                                ; (fix 149): same bytes, any
+                                                ; image layout
                         add di,4
                         and di,7Fh              ; branchless wrap (fix 96)
                         loop @@fl
@@ -3438,9 +3491,12 @@ DrwCnt proc uses ax bx cx dx si di bp
 @@n:            mov di,bp               ; both paths rejoin here: STOSW
                 add di,160              ; left DI mid-row (fix 46b)
                 add bx,SLOTSZ
-                .if (bx >= offset vCache+LINES_VIS*SLOTSZ)
-                        mov bx,offset vCache
-                .endif
+                cmp bx,offset vCache+LINES_VIS*SLOTSZ
+                jb @@cwc                 ; fix 153: same UNSIGNED compare,
+                mov bx,offset vCache     ; now by opcode for ANY image
+@@cwc:                                  ; layout (the .if relied on
+                                        ; 0CA07h not fitting SWORD,
+                                        ; fix 149)
                 add dx,4
                 and dx,7Fh              ; branchless vPos wrap (fix 96:
                                         ; entries are 4*0..4*31, 128
@@ -4032,7 +4088,7 @@ idleCnt         db 0                    ; idle-pass counter (fix 81); it
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW25>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW26>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; the cut
                                         ; step retired by fix 115)
 BSSBASE         equ $                  ; RAM base: first byte past the image
