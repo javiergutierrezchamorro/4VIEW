@@ -1,6 +1,82 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 1.26 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 1.27 - Turbo Vision style text viewer for DOS (ASMC)
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
+; Revision 1.27 fixes (155-159; a full read of the 1.26 source plus a
+; source-level Python re-simulation of the 386 store scanner over
+; block-straddling corpora - scripts/sim_store386_127.py, the same
+; method the 1.24 pass used; both builds re-assembled with ASMC and
+; the changed sites diffed against the 1.26 images):
+;  155. THE -3 BUILD TRUNCATED EVERY DISPLAY LINE CROSSING A 32 KiB
+;       BLOCK EDGE (fix 142 regression). The store scanner's SWAR
+;       rounds park the clean dword in EBP ("mov ebp,eax"), and BP
+;       doubles as RdLine's store/consume flag - tested once per line
+;       at @@fx. Fix 142's comment claimed "BP is read only at the @@fx
+;       entry", but @@fx IS re-entered after every refill (fix 121:
+;       @@rfin jumps there): a round that ends exactly at the block end
+;       takes @@sloop's "jz @@refill" with BP = the last dword, FillBuf
+;       reloads the block, and @@fx's "or bp,bp" then tests the dword's
+;       LOW word - nonzero for any ASCII pair - and switches the REST
+;       of the line to CONSUME mode: nothing more is stored, the slot's
+;       length byte counts only the stored part and WrCntRow paints the
+;       line cut at the 32 KiB multiple (curPos/vPos stay exact: the
+;       consume scan still walks to the true EOL, only the text is
+;       lost). Reachable from DrwCnt's and DrwDn1's cold fills, DrwUp1
+;       and the ScrUp rescan - i.e. every PgDn/PgUp beyond the cache
+;       and every Up across a boundary on the -3 build. The 8086 build
+;       never touches BP in its store rounds and was always right (as
+;       was the -3 count scan: @@fw/@@fwn use EAX/EDX only, so the load
+;       pass never showed it). The store scanner's flag is logically 0
+;       by construction (only @@sful can set it to 1, and it runs
+;       BEFORE any round), so the round end restores it: "xor bp,bp"
+;       after @@swn's DEC/JNZ, 2 bytes on -3, ~2 cycles per round
+;       (a round is hundreds of bytes), and the refill continuation
+;       keeps its mode for ANY line/block layout. The simulator
+;       reproduces the truncation on 1.26's algorithm and 0 mismatches
+;       with the fix over every corpus.
+;  156. VIEW #1 IS PAINTED THE MOMENT IT IS CAPTURED (the reported
+;       "dibuja la primera pantalla en cuanto este cargada"): CountLines
+;       already parsed lines 0..22 in store mode into their vCache
+;       slots (fixes 55/85), but the first paint waited for the WHOLE
+;       pre-scan - a big file showed only the chrome, "Loading ..."
+;       and the progress bar for the entire scan (~1.8 s per 385 KB on
+;       an 8088@4.77, versus ~35 ms to parse 23 lines and paint them).
+;       The capture-complete branch now calls RingPaint ONCE - the
+;       totLines==LINES_VIS-1 test fires exactly once per file, the
+;       slots and vPos entries are already consistent, curLine=0,
+;       ringN=23 - and the pre-scan continues in count mode with the
+;       bar repainting per block (FillBuf/ShowProg). RingPaint DIRECTLY,
+;       NOT Draw/DrwCnt: mid-scan curPos is the start of line 23, NOT
+;       of line 0, so DrwCnt's cold path would parse the WRONG 23 lines
+;       into the slots and corrupt the capture; DrwBar would read
+;       totLines=22 and paint a full thumb contradicting the bar; and
+;       DrwSt would wipe the "Loading ..." text and the bar cells.
+;       RingPaint touches rows 1..23 only: the status row keeps the
+;       loading text, the blinking dots and the bar, the scrollbar stays
+;       rail-only (honest: the size is not known yet) and the first
+;       real Draw after the scan repaints everything with the true
+;       numbers. STDIN keeps its FillStdin+Draw flow: a pipe may stall
+;       mid-fill, and its first screen IS the first 23 lines.
+;  157. RINGPAINT'S WRAP LIMIT VIA THE AH TRICK on the 8086: "mov
+;       ax,ringN / shl ax,8" expanded to EIGHT 1-bit shifts (fix 95
+;       hoisted the computation out of the row loop, but the chain
+;       stayed). "mov ah,byte ptr ringN / xor al,al" is 2 instructions
+;       for any ringN < 256 - the same addressing SLOTPTR uses; the -3
+;       build keeps its single native "shl ax,8". ~16 bytes and ~16
+;       cycles less per repaint on an 8086, zero change on -3.
+;  158. RDLINE'S ENTRY NUL STORE IS DEAD: "mov byte ptr [di],0" ran
+;       before the scanners, but RdLine has ONE exit (@@ret0) and the
+;       shared @@dones epilogue ALWAYS writes the NUL at [di] and the
+;       length byte before it - no path reads wDest mid-call. 3 bytes
+;       and ~14 cycles per line off the load pass; the fix 97
+;       write-before-read audit for lBuf now rests on the exit alone
+;       (still before any paint).
+;  159. DRWBAR'S "jz @@d" AFTER "sub bx,LINES_VIS" IS UNREACHABLE: the
+;       thumb section only runs for totLines >= 24 (the "jbe @@f" above
+;       routed totLines <= 23 to the full-thumb path), so bx =
+;       totLines-23 >= 1 and the zero test never fired. 2 bytes less
+;       (the same dead-code class as fix 147). Version 1.27; the image
+;       stamp is "<4VIEW27>". SMART.INC stays at v2.43.
+;
 ; Revision 1.26 fixes (152-154; the 1.25 audit - full read of the source
 ; plus a numeric re-verification of the arithmetic blocks: U2A over the
 ; whole 16-bit range, FastIMul for every constant -32768..65535 and
@@ -1259,8 +1335,8 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
 .code
 org 100h
 
-VERMAJ      equ 1                       ; product version 1.26
-VMIN        equ 26
+VERMAJ      equ 1                       ; product version 1.27
+VMIN        equ 27
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -1908,9 +1984,12 @@ SeekSoft endp
 ;------------------------------------------------------------------------------
 ; CountLines - pre-scan the whole file (buffered: fast). The speed of
 ; this pass is RdLine's: inline fetch, no per-byte curPos adds, no
-; per-line unget round trip (fixes 14/37). Since 1.06 RdLine runs here
-; in count mode (no text stores); since 1.07 (fix 54) the consume-only
-; loop eats two bytes per iteration (~29 cycles/byte).
+; per-line unget round trip (fixes 14/37). Since fix 156 the first
+; paint happens HERE: view #1 hits the screen the moment its 23 lines
+; are captured, and the rest of the scan keeps running under the bar.
+; Since 1.06 RdLine runs here in count mode (no text stores); since
+; 1.07 (fix 54) the consume-only loop eats two bytes per iteration
+; (~29 cycles/byte).
 ; NEW (fixes 55/85): the first LINES_VIS lines run in STORE mode parsed
 ; STRAIGHT into their vCache slots (no RingAppend copy pass any more:
 ; the proc is gone) and vPos records starts 0..22 plus entry 23 (the
@@ -1963,6 +2042,15 @@ CountLines proc
                         mov cntMode,1           ; count-only from here
                         mov si,LINES_VIS*4      ; vPos entry 23
                         VPSTORE si
+                        call RingPaint          ; fix 156: view #1 on screen
+                                                ; NOW - rows 1..23 from the
+                                                ; slots; NOT Draw/DrwCnt (the
+                                                ; curPos invariant is mid-scan
+                                                ; here) and NOT DrwBar/DrwSt
+                                                ; (totLines is still partial:
+                                                ; they would fight the loading
+                                                ; text and the bar). The pre-
+                                                ; scan continues below
 @@aft:                  .break .if (totLines==0FFFFh)   ; saturate (10)
                         inc totLines
                 .else
@@ -2032,12 +2120,17 @@ RingPaint proc uses ax bx cx dx si di bp
         mov bx,ringN
         div bx                          ; DX = curLine mod ringN
         SLOTPTR si,offset vCache,dl     ; SI = vCache + slot*256
+        if USE386
         mov ax,ringN                    ; the wrap limit (ringN*SLOTSZ +
         shl ax,8                        ; vCache) is loop-invariant: hoisted
-        add ax,offset vCache            ; here once (fix 95 - the per-row
-        mov dx,ax                       ; version paid a shl ax,8 chain x 23
-        mov di,160+2                    ; rows; DX is free: WrCntRow never
-        mov cx,LINES_VIS                ; touches it)
+        else                            ; here once (fix 95 - the per-row
+        mov ah,byte ptr ringN           ; version paid a shl ax,8 chain x 23
+        xor al,al                       ; rows); fix 157: the AH trick does
+        endif                           ; it in 2 instructions on an 8086
+        add ax,offset vCache            ; (ringN < 256); -3 keeps the native
+        mov dx,ax                       ; immediate shift. DX is free:
+        mov di,160+2                    ; WrCntRow never touches it
+        mov cx,LINES_VIS
         .repeat
                 mov bp,di
                 push cx
@@ -2974,8 +3067,10 @@ RdLine proc uses bx cx dx si di bp
         mov di,wDest                    ; STOSB (fixes 60/63); the caller's
         mov cx,LBUFCAP                  ; ES is restored at the single exit
                                         ; wDest = lBuf unless DrwCnt aims
-                                        ; a view-cache slot at it (fix 63)
-        mov byte ptr [di],0
+                                        ; a view-cache slot at it (fix 63).
+                                        ; NO entry NUL (fix 158): the single
+                                        ; exit's @@dones always writes it
+                                        ; before @@ret0
         xor dx,dx                       ; exit reason: 0 = EOF, 1 = EOL
         cmp hFull,0
         jne @@slowin                    ; a byte waits in the unget slot
@@ -3042,8 +3137,13 @@ RdLine proc uses bx cx dx si di bp
         stosd                           ; residue bytes re-round through
 @@swn:  dec cx                          ; @@sloop, which enters @@swr:
         jnz @@sw                        ; fix 134: DEC/JNZ, not LOOP - LOOP
-        jmp @@sloop                     ; is 11 cycles taken on a 386, this
-                                        ; pair is 9 (and worse on 486+)
+        xor bp,bp                       ; fix 155: the store flag back to 0
+        jmp @@sloop                     ; once per round - fix 142 parks the
+                                        ; dword in EBP and a refill re-enters
+                                        ; @@fx (121), whose "or bp,bp" must
+                                        ; not test the dword or the rest of
+                                        ; the line switches to consume mode
+                                        ; and truncates at the block edge.
 @@swh:  sub si,4                        ; candidate: re-scan it exactly.
                                         ; NO "sub di,4": the dword was
                                         ; never stored, DI already points
@@ -3545,9 +3645,10 @@ DrwBar proc uses ax bx cx di
                                 ; inline never wrote DX and the DIV
                                 ; read a garbage high word)
         mov bx,totLines
-        sub bx,LINES_VIS
-        jz @@d
-        div bx                          ; variable divisor: DIV stays
+        sub bx,LINES_VIS                ; >= 1 here (fix 159: the jbe above
+        div bx                          ; routed totLines <= 23 to the full
+                                        ; thumb, so the old jz never fired);
+                                        ; variable divisor: DIV stays
         .if (ax>=LINES_VIS)
                 mov ax,LINES_VIS-1
         .endif
@@ -4088,7 +4189,7 @@ idleCnt         db 0                    ; idle-pass counter (fix 81); it
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW26>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW27>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; the cut
                                         ; step retired by fix 115)
 BSSBASE         equ $                  ; RAM base: first byte past the image
