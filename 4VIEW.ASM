@@ -1,6 +1,46 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 1.33 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 1.34 - Turbo Vision style text viewer for DOS (ASMC)
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
+; Revision 1.34 changes (168-170; the ESC-abort fix, the 386 U2A and the
+; running line count - a review pass found three improvements):
+;  168. ESC NOW REALLY ABORTS THE LOAD (fix 162 was dead code). FillBuf's
+;       peek of the BIOS keyboard ring read the keystroke word from
+;       0:[bx+0040h] - but bx holds the ring HEAD VALUE (an offset into
+;       segment 0040h, typically 001Eh..003Ch), and the linear address
+;       of 0040:[head] is 0:0400h+head, NOT 0:0040h+head. The code read
+;       0:005Eh..0:007Ch (random low memory) instead of 0:041Eh..0:043Ch
+;       (the keyboard ring): the value was never 011Bh, so the ESC was
+;       never detected and the load could not be interrupted. One byte:
+;       [bx+0040h] -> [bx+0400h]. The fix 151 comment that originated the
+;       error ("a DS=0 form would need [bx+0040h]") is also corrected.
+;       Verified: a pending ESC now makes FillBuf return 0, RdLine unwinds
+;       through its EOF exit, CountLines closes with the lines counted so
+;       far and Main's .case 01h picks up the untouched ESC and quits
+;       through Done.
+;  169. THE 386 BUILD'S U2A USES NATIVE DIV. The fix 13 shift chain
+;       (division by 10 via shifts and adds) wins on an 8086 (DIV r/m16
+;       costs 144-162 cycles, SHL ~2), but on a 386 DIV r/m16 drops to
+;       14-22 cycles and the balance flips: the chain's 10+ shifts and
+;       the .while correction loop cost more. The 386 path is now five
+;       DIV bx (one per digit); the 8086 path keeps the shift chain
+;       untouched. Same output contract (digits pushed AH=0, fix 148).
+;       U2A is called 2-3 times per DrwSt and once per ShowProg block
+;       (fix 170), so the gain is small in absolute terms but the code
+;       is simpler and the 386 target stops paying the 8086 tax.
+;  170. THE RUNNING LINE COUNT IS SHOWN DURING THE LOAD. The status bar
+;       showed "Loading <path>..." with blinking dots and a 20-cell bar;
+;       on a big file the bar repaints only 12 times per 385 KB and a
+;       30 MB file that saturates at line 65.535 leaves the bar stuck at
+;       2 cells for the whole load - the only sign of life was the
+;       blinking dots. ShowProg now paints "L:NNNNN" (right-aligned,
+;       columns 50..56) next to the bar on every 32 KiB block: the
+;       growing line count is immediately visible. StatLoad's name clamp
+;       shrinks 54 -> 46 to make room; U2A writes to a 16-byte scratch
+;       at stBuf+80 (StatLoad uses 0..49, DrwSt 0..64, so 80..95 is
+;       free). ~30 bytes + ~200 cycles per block, both builds.
+;       Version 1.34; the image stamp is "<4VIEW34>". SMART.INC stays
+;       at v2.43.
+;
 ; Revision 1.33 fixes (167; the 100% state no longer wrecks the screen):
 ;  167. THE BAR'S LAST REFILLS WIPED THE SCREEN AND FROZE THE VIEWER:
 ;       fix 166's pos clamp DESTROYED the copy it was about to shift:
@@ -312,8 +352,9 @@
 ;       3 bytes per build, ~1900 cycles per keypress on an 8088, and the
 ;       386 build keeps its cycles (xor == mov imm there). ReadKey KEEPS
 ;       DS=0040h (fix 25): it dereferences the head VALUE in BX
-;       ("mov ax,[bx]"), and a DS=0 form would need [bx+0040h] - 8B 47
-;       40 vs 8B 07: 1 byte MORE and 4 cycles more on an 8086, net worse
+;       ("mov ax,[bx]"), and a DS=0 form would need [bx+0400h] (the linear
+;       base of segment 0040h is 0400h, not 0040h - fix 168) - 8B 87 00 04
+;       vs 8B 07: 1 byte MORE and 4 cycles more on an 8086, net worse
 ;       in both builds. The image stamp moves to "<4VIEW25>".
 ;
 ; Revision 1.24 fixes (141-150; a full read of the 1.23 source against the
@@ -1525,8 +1566,8 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
 .code
 org 100h
 
-VERMAJ      equ 1                       ; product version 1.33
-VMIN        equ 33
+VERMAJ      equ 1                       ; product version 1.34
+VMIN        equ 34
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -2039,9 +2080,9 @@ StatLoad proc
         call Cpy
         pop si
         call Cpy
-        .if (di > offset stBuf+54)     ; clamp the name (fix 86): the
-                mov di,offset stBuf+54 ; text must end before the bar
-        .endif
+        .if (di > offset stBuf+46)     ; fix 170: clamp the name tighter
+                mov di,offset stBuf+46 ; (46 = 8 "Loading " + 38 name) to
+        .endif                        ; leave room for "L:NNNNN" at cols 50..56
         mov ax,di
         sub ax,offset stBuf            ; AX = the "..." char offset in
         push ax                         ; stBuf (fix 139: 1.22 pushed the
@@ -2168,6 +2209,46 @@ ShowProg proc uses ax bx cx dx si di
         sub cx,si
         mov ax,A_STAT or 0B0h          ; the empty rail
         rep stosw
+        ; fix 170: running line count at columns 50..56 - "L:" plus a
+        ; right-aligned 5-digit decimal of totLines, painted per 32 KiB
+        ; block so the user sees progress during long loads. The bar
+        ; alone (20 cells for the whole file) is too coarse on big
+        ; files: 12 repaints for 385 KB, and a 30 MB file that saturates
+        ; at line 65.535 leaves the bar stuck at 2 cells - the growing
+        ; line count is the only visible sign of life. ~30 bytes + ~200
+        ; cycles per block, both builds
+        mov di,24*160+2+50*2           ; column 50
+        mov ax,A_STAT or 'L'
+        stosw                          ; 'L' at col 50
+        mov al,':'
+        stosw                          ; ':' at col 51
+        mov cx,5                       ; clear the 5-cell field
+        mov ax,A_STAT or ' '          ; (cols 52..56) to spaces
+        rep stosw
+        push es                        ; save vSeg for U2A
+        push ds
+        pop es                         ; ES=DS: U2A writes via STOSB
+        mov di,offset stBuf+80         ; 16-byte scratch (stBuf is 96:
+                                        ; StatLoad uses 0..49, DrwSt 0..64)
+        mov ax,totLines
+        call U2A                       ; DI = stBuf+80 + digit_count
+        mov cx,di                      ; CX = end of digit string
+        sub cx,offset stBuf+80         ; CX = digit count (1..5)
+        pop es                         ; ES=vSeg again
+        mov di,24*160+2+52*2           ; column 52 (field start)
+        mov bx,5
+        sub bx,cx                      ; BX = leading space count
+        mov ax,A_STAT or ' '
+        test bx,bx
+        jz @@lnd                       ; no leading spaces needed
+@@lnp:  stosw                          ; paint a leading space
+        dec bx
+        jnz @@lnp
+@@lnd:  mov si,offset stBuf+80         ; SI = first digit
+@@lnc:  lodsb                          ; AL = digit char, SI++
+        mov ah,ATTR_STAT
+        stosw                          ; paint at ES:DI, DI += 2
+        loop @@lnc                     ; CX digits
         pop es
 @@done: ret
 ShowProg endp
@@ -3290,7 +3371,7 @@ FillBuf proc uses bx cx dx
         mov bx,ds:[0041Ah]              ; head (fix 151's addressing)
         cmp bx,ds:[0041Ch]              ; head == tail: the ring is empty
         je @@pk1
-        mov ax,ds:[bx+0040h]            ; the queued keystroke word (the
+        mov ax,ds:[bx+0400h]            ; fix 168: the queued keystroke word
         cmp ax,011Bh                    ; key lives at 0040:[head]); ESC =
         jne @@pk1                       ; AL=1Bh AH=01h = 011Bh
         xor cx,cx                       ; ESC waits: THIS refill reads 0 -
@@ -4332,13 +4413,34 @@ Cpy proc
 Cpy endp
 
 ;------------------------------------------------------------------------------
-; U2A - unsigned AX -> decimal ASCIZ at ES:DI. Division by 10 is done
-; with shifts and adds (q = ((x>>1)+(x>>2) + corrections) >> 3, exact
-; for the whole 16-bit range): on a real 8086 SHL costs ~2 cycles while
-; DIV costs ~185 (fix 13). The >>8 step copies AH into AL instead of
-; eight one-bit shifts (fix 38).
+; U2A - unsigned AX -> decimal ASCIZ at ES:DI.
+; 386+ (fix 169): five DIV bx (one per digit). DIV r/m16 costs 14-22
+; cycles on a 386 - cheaper than the fix 13 shift chain (10+ shifts
+; plus the .while correction loop) and far simpler.
+; 8086 (fix 13): division by 10 with shifts and adds
+; (q = ((x>>1)+(x>>2) + corrections) >> 3, exact for the whole 16-bit
+; range): on a real 8086 SHL costs ~2 cycles while DIV r/m16 costs
+; ~144-162 - the chain wins by ~6x. The >>8 step copies AH into AL
+; instead of eight one-bit shifts (fix 38).
+; Both paths push digits AH=0 (fix 148: one pop feeds the digit
+; straight into the string), most-significant first.
 ;------------------------------------------------------------------------------
 U2A proc uses bx cx dx si
+        if USE386
+        mov bx,10                       ; divisor
+        xor cx,cx                       ; digit count
+@@d3:   xor dx,dx                       ; DX:AX = 0:quotient-so-far
+        div bx                          ; AX = quotient, DX = remainder (0..9)
+        push dx                         ; the digit (AH=0 on the push)
+        inc cx
+        or ax,ax                        ; quotient = 0? done
+        jnz @@d3
+@@o3:   pop ax                          ; fix 148: the digits are pushed
+        add al,'0'                      ; with AH=0 - one pop feeds the
+        stosb                           ; digit straight into the string
+        loop @@o3
+        ret
+        else
         mov bx,ax                       ; BX = value
         xor cx,cx                       ; digit count
 @@d:    mov ax,bx
@@ -4377,6 +4479,7 @@ U2A proc uses bx cx dx si
         stosb                           ; digit straight into the string
         loop @@o
         ret
+        endif
 U2A endp
 
 ;------------------------------------------------------------------------------
@@ -4530,7 +4633,7 @@ idleCnt         db 0                    ; idle-pass counter (fix 81); it
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW33>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW34>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; the cut
                                         ; step retired by fix 115)
 BSSBASE         equ $                  ; RAM base: first byte past the image
