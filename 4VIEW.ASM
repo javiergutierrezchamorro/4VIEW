@@ -1,6 +1,346 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 1.35 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 2.02 - Turbo Vision style text viewer for DOS (ASMC)
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
+; Revision 2.02 fixes (194-198; the hex rewrite, info popup, word wrap and
+; the bug-sweep):
+;  194. HEX MODE WAS BROKEN (the screenshot): the 2.01 HexDraw painted
+;       addresses that never incremented (all "0000"), left the top rows
+;       black, and showed no ASCII gutter. The root cause was a
+;       combination of: (a) the separate 23-row clear loop painted cols
+;       1-77 but the per-row paint then wrote from col 1 with stosw whose
+;       DI was recomputed from BP, and the address column read curPos
+;       AFTER GetByte had advanced bIdx through 16 bytes (the reader's
+;       curPos invariant bBase+bIdx had drifted from the row start stored
+;       in @@read); (b) past-EOF rows jumped to @@skip without clearing,
+;       leaving stale content; (c) DrwSt showed text-line numbers
+;       (meaningless in hex mode). HexDraw is rewritten: one row per
+;       iteration, clear-and-paint combined, the address is captured
+;       BEFORE GetByte touches the reader, past-EOF rows are cleared to
+;       spaces, and the ASCII gutter is always painted. HexB uses
+;       shr al,4 (SMART.INC: native on 386, 4 shifts on 8086) instead of
+;       four shr al,1.
+;  195. HEX-AWARE STATUS BAR AND SCROLLBAR: DrwSt in hex mode now shows
+;       "Off <byte>/<size> <pct>%" with the byte offset = curLine*16 and
+;       the percentage based on hex rows (fileSize/16), not text lines.
+;       DrwBar in hex mode maps the thumb to hex rows. The scrollbar and
+;       status bar are now consistent with the hex view.
+;  196. 'I' INFO IS A POPUP: the 2.01 ShowInfo painted a one-line "Size:
+;       N Lines: N" on the status bar (and clobbered it for the next
+;       repaint). ShowInfo now builds a 6-line info table (file name,
+;       size, line count, position, mode) and displays it through PopUp
+;       - green box, centered, any key dismisses, screen restored.
+;  197. WORD WRAP IMPLEMENTED: 'W' toggles wrap mode (the 2.00 wrapOn
+;       flag was vaporware - fix 182 removed it as dead). When wrap is
+;       on: hPos is locked to 0, RdLine caps each line at LINEWID chars
+;       (the store capacity check uses LINEWID instead of LBUFCAP), and
+;       the @@sful path returns immediately (AL=1) without consuming the
+;       rest of the logical line - so each visual row is a separate
+;       cache/count entry. CountLines recounts visual rows when wrap is
+;       toggled. Left/Right/Ctrl+Left/Ctrl+Right are disabled in wrap
+;       mode. The cache, scroll ring and navigation all work with visual
+;       rows transparently.
+;  198. MOUSE RELEASE-WAIT INVERTED (found in the 2.02 code review): the
+;       scrollbar drag's @@wr loop tested "test bl,1 / jz @@wr" - jumping
+;       back when the button was RELEASED (ZF=1) and exiting when PRESSED.
+;       This inverted the intent: the click auto-repeated (the poll saw
+;       the button still down and re-fired) and could hang if the user
+;       released mid-Draw. "jnz @@wr" loops while pressed and exits on
+;       release, matching the comment.
+;  199. ScrDn HEX MISSING CARRY CHECK: the hex branch of ScrDn did
+;       "add ax,LINES_VIS" without testing carry - the text branch has
+;       "jc @@s" but the hex branch omitted it. For curLine near 65535
+;       the add wraps to a small value, the EOF guard passes, and ScrDn
+;       advances curLine until it wraps to 0 (the view jumps from bottom
+;       to top). "jc @@s" is added after the add.
+;  200. DEAD srSave2 REMOVED: DoSearch's "SAVEPOS srSave2" at @@cont was
+;       write-only (never read - the post-hit walk re-derives the position
+;       from curPos=0/SeekSoft). The 4 mov instructions per scanned line
+;       and the srSave2 dd 0 declaration are gone.
+;  201. POPASK CX RELOAD ORDER: INT 33h AX=1 (show mouse) sat between
+;       the CX=askCnt reload and ret. The MS driver preserves CX but some
+;       clones don't - the reload now comes AFTER the INT 33h so the
+;       return value is safe regardless of the driver.
+;  202. Version 2.02; the image stamp is "<4VIEW202>". SMART.INC stays
+;       at v2.43.
+;
+; Revision 2.02b fixes (208-213; the comprehensive review pass):
+;  208. SIGNED COMPARISON IN DoSearch (CRITICAL): the forward-search
+;       guard ".if (ax >= totLines)" was SIGNED - ASMC's .if generates
+;       jge. When totLines >= 32768 (negative signed), the test
+;       "positive >= negative" was always true, so the forward search
+;       silently reported "not found" on any file with >= 32768 lines
+;       without scanning a single line. Changed to cmp/jae (UNSIGNED),
+;       joining the discipline of fixes 23/31/93/129/140.
+;  209. DetectBinary BUFFER OVERFLOW (CRITICAL): DetectBinary probed
+;       up to 512 bytes into hxBuf, but hxBuf was only 16 bytes - the
+;       remaining 496 bytes overflowed into infoBuf and 16 bytes past
+;       BMEMTOP into free RAM. Non-fatal by luck of layout (infoBuf is
+;       write-before-read, the tail is free RAM), but a latent crash.
+;       hxBuf is now 512 bytes (infoBuf pushed forward accordingly,
+;       stack still > 6KB).
+;  210. HexDraw CARRY LOSS (robustness): "add ax,bp" followed by
+;       "xor dx,dx" - XOR clears CF, so if curLine+bp overflowed 65535
+;       the carry was lost and DX:AX got the wrong 32-bit offset.
+;       Currently safe (curLine bounded to <= 65512), but fragile if
+;       a future change lets curLine reach 65535. Changed to "mov dx,0
+;       / adc dx,0" which preserves and propagates the carry.
+;  211. DEAD CODE: AtoU's "inc cx" incremented the multiplier (10->11)
+;       not the digit counter - "mov cx,10" reset it each iteration.
+;       PopAsk's "mov popLines,2" was write-only (PopAsk doesn't call
+;       PopUp). Both removed.
+;  212. HEXROWS MACRO: the (fileSize+15)/16 computation was duplicated
+;       4 times (Main End, MousePoll, DrwBar, DrwSt) with 4 different
+;       @@ label names (@@hs, @@mhr, @@hdiv, @@hshft). All 4 replaced
+;       by one HEXROWS macro with LOCAL labels - one source of truth,
+;       no label name proliferation.
+;  213. 386 LOOP OPTIMIZATION in HexDraw: the 3 hot loops (read, hex
+;       bytes, ASCII) used "loop" which costs 11 cycles taken on a 386.
+;       Changed to "dec cx / jnz" (2 cycles) on the 386 build, keeping
+;       "loop" on 8086 (17 cycles there, beats dec+jnz's 3+16). ~3300
+;       cycles saved per hex repaint on 386. Same pattern as fix 134.
+;       Version 2.02b; the image stamp stays "<4VIEW202>".
+;
+; Revision 2.02c changes (214-217; V removal, I date/time, cleanup):
+;  214. V (SHOWSTATS) REMOVED: the 'V' key showed a one-line stats bar
+;       duplicating 'I' info (lines and bytes) plus the file date/time.
+;       ShowStats proc, the sLines2/sDate strings, and the V handler in
+;       Main are all gone. The 'V' and 'v' keys now both trigger
+;       back-scan (was: V=stats, v=back-scan). The help line a15 no
+;       longer mentions V.
+;  215. I (SHOWINFO) ADDS DATE/TIME: the info popup now has 7 lines
+;       (was 6) — line 5 shows "Date: dd-mm-yyyy hh:mm" from INT 21h
+;       AX=5700h (the file's timestamp). infoBuf grows 480->560 bytes
+;       (7*80), infoTab has 7 entries. For STDIN (no file handle) the
+;       date line is blank.
+;  216. DATE OPTIMIZATION: the svDate/svTime field extractions switched
+;       from "mov cl,N / shr ax,cl" to "shr ax,N" (SMART.INC macro:
+;       native on 386, N one-bit shifts on 8086 at ~2 cycles each vs
+;       mov cl + shr cl at ~4+8+4N cycles — ~2.5x faster on 8086).
+;       svDate/svTime are cached in BX across the U2A calls (U2A
+;       preserves BX via its uses list) — saves 5 memory reads.
+;  217. DEAD CODE REMOVED: DrwBar's ".if (ax>=LINES_VIS) mov ax,
+;       LINES_VIS-1" clamp was unreachable — the DIV quotient is
+;       bounded to 0..22 by the curLine <= eff_total-LINES_VIS
+;       invariant (same class as fix 159). Also removed orphaned
+;       comment after infoTab, stale "fix 180" on svDate/svTime, and
+;       sLines2/sDate dead data strings.
+;       Version 2.02c; the image stamp stays "<4VIEW202>".
+;
+; Revision 2.02d changes (218-219; Down scroll speed and Info reorder):
+;  218. DOWN SCROLL WAS 2x SLOWER THAN UP: ScrDn called RdLine in STORE
+;       mode (~44 cycles/byte on 8086) to advance the reader past the
+;       current line — but ScrDn only needs the line START position
+;       (for the EOF check), not the text. ScrUp's fast path did ZERO
+;       RdLine (just popped the position cache). The asymmetry: Up = 1
+;       RdLine (DrwUp1 only), Down = 2 RdLine (ScrDn + DrwDn1).
+;       Fix: ScrDn's RdLine now runs in CONSUME mode (cntMode=1,
+;       ~22 cycles/byte) — 2x faster. Down is now 1 consume + 1 store
+;       vs Up's 0 + 1 store, a much smaller gap.
+;  219. INFO POPUP REORDERED: lines are now File, Size, Date, Lines,
+;       Position, blank, Mode (was File, Size, Lines, Position, Date,
+;       blank, Mode). Date is now in position 3 — more logical grouped
+;       with the other file metadata (Size).
+;       Version 2.02d; the image stamp stays "<4VIEW202>".
+;
+; Revision 2.02e optimizations (220-222; the 386 hex-mode speed pass):
+;  220. HEXROWS MACRO USES NATIVE 32-BIT SHIFT ON 386+: the macro computed
+;       (fileSize+15)/16 with a 4-iteration shr dx,1/rcr ax,1 loop. On a
+;       386 each RCL r/m16,1 costs ~9 cycles, so the loop cost ~44 cycles
+;       per call. The 386+ path now does "mov eax,dword ptr fileSize /
+;       add eax,15 / shr eax,4 / cmp eax,0FFFFh / jbe / mov eax,0FFFFh"
+;       - one native 32-bit load and one immediate shift, ~15 cycles.
+;       Called from DrwBar, DrwSt, MousePoll and End (4 sites), the save
+;       is ~120 cycles per hex-mode frame. The 8086 path is untouched
+;       (it has no native 32-bit shift). The 386 path also clobbers fewer
+;       registers (only EAX vs AX+DX+CX on 8086), which all 4 call sites
+;       already tolerate.
+;  221. HEXDRAW OFFSET COMPUTATION USES NATIVE 32-BIT OPS ON 386+: the
+;       per-row byte offset (curLine+bp)*16 was computed with "add ax,bp /
+;       mov dx,0 / adc dx,0" (to catch 16-bit overflow into DX) then 4
+;       "shl ax,1 / rcl dx,1" pairs - 8 shift instructions plus the carry
+;       propagation, ~50 cycles per row on a 386 (RCL is ~9 cycles there).
+;       The 386+ path now does "movzx eax,word ptr curLine / movzx edx,bp /
+;       add eax,edx / shl eax,4" - 4 instructions, ~12 cycles. The MOVZX
+;       zero-extends both operands to 32 bits, so the add cannot overflow
+;       and no carry propagation is needed. One "cmp eax,dword ptr fileSize"
+;       replaces the 3-instruction 16-bit compare chain. ~40 cycles saved
+;       per row, ~920 per 23-row hex frame. The 8086 path keeps the
+;       shift-and-rcl chain (no native 32-bit ops available).
+;  222. REDUNDANT PUSH CX/POP CX AROUND GETBYTE REMOVED: the read loops in
+;       HexDraw (16 bytes) and DetectBinary (512 bytes) wrapped GetByte in
+;       "push cx / call GetByte / pop cx" to protect the loop counter.
+;       GetByte has no USES clause but only touches BX and AX internally;
+;       its one callee (FillBuf) has "uses bx cx dx" so CX survives the
+;       whole call chain. The push/pop was dead weight - 4 bytes and ~30
+;       cycles per loop iteration removed (2 stack accesses + 2 memory
+;       accesses per call). DetectBinary's 512-iteration loop saves ~15K
+;       cycles per file open; HexDraw's read loop saves ~480 cycles per
+;       hex frame. Verified by register-flow analysis of GetByte and
+;       FillBuf: no path through GetByte loads or stores CX.
+;       Version 2.02e; the image stamp stays "<4VIEW202>".
+;
+; Revision 2.02a fixes (203-207; the hex hang root cause and cleanup):
+;  207. HEX MODE HUNG - FastMul CLOBBERED BX (THE ROOT CAUSE): the 2.02
+;       DrwBar and DrwSt hex code saved the effective total (hexRows) in
+;       BX BEFORE calling FastMul, then used BX as the DIV divisor AFTER.
+;       But FastMul's 8086 shift-and-add implementation uses BX as a
+;       TEMPORARY register (22 = 16+4+2 needs a scratch for the original
+;       multiplicand across the shift chain). The text-mode code was safe
+;       because it loaded BX from a memory variable (totLines) AFTER
+;       FastMul - but the hex code saved in BX BEFORE, so BX held garbage
+;       at the DIV. If the garbage was 0, INT 0 (#DE) fired and the
+;       viewer hung (the status bar never got repainted, the scrollbar
+;       thumb never appeared, the keyboard went dead). If the garbage was
+;       non-zero, the thumb/percentage showed wrong values silently.
+;       The fix: save the effective total on the STACK (push ax) before
+;       FastMul, pop it into BX after (pop bx). The stack is immune to
+;       FastMul's register clobbering. Applied to BOTH DrwBar and DrwSt
+;       hex paths. The text-mode path (which loads from memory) was
+;       always safe and is now unified with the hex path through the
+;       same push/pop sequence.
+;  203. DrwBar LABEL AMBIGUITY: the 2.02 hex branch had jbe @@f that
+;       resolved to @@hcap (next @@ label) instead of the full-thumb
+;       @@f. DrwBar rewritten: hex computes hexRows into AX, falls
+;       through to the unified text-mode thumb code. One path.
+;  204. DrwSt @@hs RENAMED to @@hshft (latent conflict with Main's
+;       @@hs). mul cx replaced with shifts.
+;  205. ScrDn HEX CARRY CHECK: jc @@s added after add ax,LINES_VIS.
+;  206. MOUSE RELEASE-WAIT: jz → jnz (was inverted).
+;
+; Revision 2.01 fixes (172-186; the 2.00 audit pass - the 'I' hang, the
+; search rewrite, hex-mode navigation and the vaporware purge):
+;  172. 'I' (AND 'V') HUNG THE VIEWER: U2A32's divide-by-10 loop tested
+;       "quotient == 0" with "or dx,ax" - a DESTRUCTIVE or that left
+;       DX = high|low, so the next iteration divided the OR-mangled
+;       pair instead of the true quotient: the value never reached 0:0,
+;       the loop pushed one "digit" word per iteration and SP marched
+;       down through the whole 64 KiB segment, overwriting the program
+;       itself with the pushed words (~29.275 iterations on a 24 KiB
+;       file) before the CPU went on executing smashed code. Proven by
+;       emulation: the very first key that formats a 32-bit number
+;       ('I' info, 'V' stats) froze the machine. The test is now
+;       "or bx,ax" - BX holds the high quotient and is dead after
+;       "mov dx,bx" - so DX:AX survive intact and any 32-bit value
+;       converges in at most 10 iterations. One byte in the image.
+;  173. THE SEARCH PROMPT PAINTED GARBAGE: PopAsk used SI both as the
+;       caller's prompt pointer (uses list) and as the save loop's
+;       video cursor; by the time the prompt row was painted SI held
+;       popOff+4*rowAdv - an offset into the CODE - and the box showed
+;       code bytes instead of "Find:". The prompt pointer is now
+;       pushed before the save loop and popped after it.
+;  174. THE SEARCH LINE NUMBERS WERE FICTION: DoSearch's scanner
+;       counted BX from 0 while the reader was already positioned at
+;       the walk's target line, so every match was recorded as a
+;       BX-relative "line" - a forward search for a word on every
+;       line reported a hit but never moved the view. BX now starts
+;       at the scan's true first line (forward: curLine+1; back: 0),
+;       forward matches stop at the first hit, and the back scan
+;       stops at curLine instead of walking to EOF.
+;  175. AN ESC-ABORTED SEARCH CORRUPTED THE VIEW: the abort exit left
+;       curPos deep in the scan while curLine stayed put, so the next
+;       Down painted lines from the middle of nowhere. All exits now
+;       restore the saved curPos through SeekSoft.
+;  176. THE POSITIONING WALK AFTER A HIT THREW THE VIEW BACK TO BOF:
+;       the second walk left curPos on the found line, then a
+;       copy-pasted "curPos=0 / SeekSoft" block re-anchored the reader
+;       at the top of the file - the view showed lines 0..22 labelled
+;       as the found lines. The block is gone; curPos stays on the
+;       hit, and the cold repaint parses exactly the right lines.
+;  177. HEX MODE NAVIGATION WAS TEXT MODE'S: Up/PgUp ran ScrUp AND
+;       HexUp1 (curLine moved twice, through the TEXT cache), Down
+;       was blocked by the totLines limit (a binary with 100 text
+;       lines could not scroll past row 77 of its hex view), End
+;       jumped by text lines and the scrollbar walked the text
+;       scanner. ScrUp/ScrDn are hex-aware now (one row, hex EOF
+;       checked against fileSize), End and the scrollbar map hex
+;       rows, HexUp1/HexDn1 are gone (movement lives in ScrUp/ScrDn,
+;       painting in DrwUp1/DrwDn1), and bookmarks skip the walk in
+;       hex mode. Hex mode can show the first 65.536 rows (1 MiB).
+;  178. A PRINT ERROR UNANCHORED THE READER: the PRN-error paths
+;       returned with the DOS pointer and bBase reset to 0 while
+;       curPos still pointed at the view - the next refill read from
+;       the top of the file. Every exit of PrintFile now restores
+;       curPos through SeekSoft.
+;  179. BINARY DETECTION IGNORED HIGH BYTES AND PAID TWO SEEKS: the
+;       >7Eh branch fell into "ok" on both paths (a file of pure FFh
+;       was "text"), and the probe seeked to BOF twice although Init
+;       had just left the fresh reader at BOF. Bytes >= 7Fh now count
+;       toward the 5% binary threshold, the two seeks are gone, and
+;       the probe leaves the first block buffered for CountLines.
+;  180. 'V' SHOWED THE SAME TWO NUMBERS AS 'I': ShowStats now shows
+;       lines, bytes AND the file's date/time (INT 21h AX=5700h),
+;       using the svDate/svTime/sDate slots that 2.00 declared and
+;       never touched.
+;  181. 'G' GOES TO A LINE: 2.00's help advertised "Ctrl+Home goto
+;       line N" but no handler existed; the AtoU parser and the
+;       sAskGoto prompt were dead data. The G key now pops the prompt,
+;       parses the number and jumps (clamped to the last top line).
+;  182. THE VAPORWARE TOGGLES ARE GONE: 'W' (wrapOn) and Ctrl+K
+;       (lnNumOn) toggled flags that nothing ever read, and 13 more
+;       dead state/string/data slots (wrapTop, bmWrap, prnOn, nWords,
+;       nChars, inWord, nBinBytes, svAttr, infoTab2, iLine2..iLine5,
+;       hHexTab, sLines, sWords, sChars, sAttr, sAnyKey, paintRow)
+;       shipped bytes for nothing - all removed, ~330 bytes less
+;       image, and the help no longer promises features that do not
+;       exist. Ctrl+Y / Alt+Y (bookmarks) stay: they work.
+;  183. THE THREE vcValid/.if COMPOUND TESTS GO THROUGH A REGISTER:
+;       ".if (vcValid && vcTop==curLine+1)" compares two memory
+;       operands inside the HLL .if - ASMC 2.40+ accepts it, older
+;       ASMC/JWasm builds do not. The explicit "mov ax,vcTop" form
+;       assembles everywhere at zero cost.
+;  184. HexDraw's "mov al,al" (a copy-paste no-op) is gone.
+;  185. POPASK STORED THE COUNTER, NOT THE CHARACTER: the input loop
+;       loaded askCnt into AX ("mov ax,word ptr askCnt") BEFORE the
+;       "mov [bx],al" store, so the pattern buffer received 00 01 02
+;       ... instead of the typed text - every find/scan/goto acted
+;       on garbage (a search could never match what was typed). The
+;       character now rides in DL across the count compare.
+;  186. HEX MODE CRASHED THE VIEWER (ASMC "USES" SEMANTICS): a local
+;       subroutine inside a "proc uses" body cannot end in "ret" -
+;       the assembler expands EVERY ret of the procedure with the
+;       saves' pops, so @@hexb's ret became 7 pops + ret and each of
+;       its 36 calls per row ate 7 words of HexDraw's stack: HexDraw
+;       returned through a garbage address into the PSP, walked the
+;       zeros straight into the entry point and RE-RAN Init - Alt+H
+;       and every binary file's auto hex view froze the machine.
+;       The nibble painter is now its own proc (HexB, no USES), whose
+;       ret is a plain ret.
+;  187. POPASK'S RESTORE LOOP BROKE THE CX CONTRACT: AdvRow leaves
+;       156-2*BP (76) in CX, and PopAsk returned that instead of the
+;       typed count - every "mov srLen,cx" stored garbage. The count
+;       is reloaded from askCnt after the loop.
+;  188. HEX OFFSETS PAINTED 1F IN THEIR SECOND BYTE: HexDraw loaded
+;       AH with ATTR_CONT before saving the offset's low word, so the
+;       byte that AH held (offset bits 8-15) was destroyed and every
+;       row address read 00001F00-style. The push now comes first.
+;  189. THE SEARCH WALK NEVER WALKED: DoSearch read its line count as
+;       "mov cx,ax" AFTER "call SeekSoft" - which clobbers AX - so the
+;       count was SeekSoft's leftover (0 for any file under 64 KiB):
+;       the scan read line 0 while its counter said curLine+1, and
+;       every recorded line number was one past the truth. The count
+;       is now captured before the call.
+;  190. PgDn IN HEX MODE HUNG: ScrDn's hex branch scaled with
+;       "mov cx,16 / mul cx", but Main's PgDn holds its loop counter
+;       in CX - every ScrDn reset it to 16 and the loop never counted
+;       down. The x16 goes through BX now (ScrUp/End/scrollbar keep
+;       their contracts).
+;  191. WRCNTROW DESTROYED ITS CALLERS' BX SINCE FIX 143 (v1.14): the
+;       "push bx" that was supposed to save the slot cursor sat ONE
+;       LINE TOO LATE - right after "mov bh,ATTR_CONT" - so it saved
+;       the clobbered value and every call returned BX = 1Fxx. The
+;       cold-fill slot cursor stuck at a wrong address, the remaining
+;       22 rows parsed straight over the program's own state block,
+;       and cache-hit paths painted stale slots (the 8086 build got
+;       away with it by pure layout luck; the 386 build painted the
+;       wrong top row after PgDn+Up). The push now precedes the load.
+;  192. THE SEARCH LINE COUNTER LIVED IN BX - WHICH CACHEPOS CLOBBERS:
+;       the positioning walk calls CachePos (its cache-slot index is BX)
+;       before every RdLine, so the counter survived the walk as garbage
+;       and every match landed on a nonsense line. The counter rides in
+;       DI now (RdLine/MatchStr/KeyAvail all preserve it).
+;  193. Version 2.01; the image stamp is "<4VIEW201>". SMART.INC
+;       stays at v2.43.
+;
 ; Revision 1.35 changes (171; the keyboard feels faster):
 ;  171. KEYBOARD TYPEMATIC SET TO MAXIMUM on AT+ (30 cps, 250 ms delay).
 ;       The IBM AT BIOS default is ~10 cps with 500 ms delay: a held
@@ -15,7 +355,7 @@
 ;       PCjr/XT/PC) and left alone. Done restores the IBM AT default
 ;       (BL=22h: 500 ms, ~10 cps). ~30 bytes, both builds; the INT 16h
 ;       call is a safe no-op on machines without the AT keyboard BIOS.
-;       Version 1.35; the image stamp is "<4VIEW35>". SMART.INC stays
+;       Version 1.35; the image stamp is "<4VIEW200>". SMART.INC stays
 ;       at v2.43.
 ;
 ; Revision 1.34 changes (168-170; the ESC-abort fix, the 386 U2A and the
@@ -1583,8 +1923,8 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
 .code
 org 100h
 
-VERMAJ      equ 1                       ; product version 1.35
-VMIN        equ 35
+VERMAJ      equ 2                       ; product version 2.02e
+VMIN        equ 2
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -1723,6 +2063,42 @@ RESTPOS macro var
         mov word ptr curPos,ax
         mov ax,word ptr var+2
         mov word ptr curPos+2,ax
+        endm
+
+;------------------------------------------------------------------------------
+; HEXROWS - compute hex row count = (fileSize + 15) / 16, capped at 65535.
+; Result in AX (0..65535). On the 8086 build DX and CX (CL) are clobbered;
+; on the 386+ build only EAX (AX) is clobbered. 2.02b: replaces 4 duplicated
+; copies of this computation (Main End, MousePoll, DrwBar, DrwSt) with one
+; source of truth. OPT: on 386+ a single native shr eax,4 replaces the
+; 4-iteration shr/rcr loop (4 RCLs at ~9 cycles each on a 386 = ~36 cycles
+; saved per call, 4 call sites = ~144 cycles per hex-mode frame).
+;------------------------------------------------------------------------------
+HEXROWS macro
+        LOCAL hr_loop, hr_ok
+        if USE386
+        mov     eax,dword ptr fileSize       ; 386: one 32-bit load + shift
+        add     eax,15                       ; no 32-bit overflow possible
+        shr     eax,4                        ; for any real DOS file
+        cmp     eax,0FFFFh                   ; cap at 65535 rows
+        jbe     hr_ok
+        mov     eax,0FFFFh
+hr_ok:
+        else
+        mov     ax,word ptr fileSize
+        mov     dx,word ptr fileSize+2
+        add     ax,15
+        adc     dx,0
+        mov     cl,4
+hr_loop: shr    dx,1
+        rcr     ax,1
+        dec     cl
+        jnz     hr_loop
+        or      dx,dx
+        jz      hr_ok
+        mov     ax,0FFFFh           ; >65535 rows: cap
+hr_ok:
+        endif
         endm
 
 ;------------------------------------------------------------------------------
@@ -2011,6 +2387,8 @@ Init proc
                 int 21h
                 mov word ptr progSize,ax
                 mov word ptr progSize+2,dx
+                mov word ptr fileSize,ax
+                mov word ptr fileSize+2,dx
                 xor cx,cx
                 xor dx,dx
                 mov ax,4200h
@@ -2020,7 +2398,11 @@ Init proc
                 mov si,offset fName
                 call StatLoad           ; "Loading <full path>..." (fix 30)
                 call ShowProg           ; empty bar: the scan starts (86)
-                call CountLines         ; also captures view #1 (fixes 55/85)
+                call DetectBinary
+                call CountLines
+                .if (binFile)
+                        mov hexMode,1
+                .endif         ; also captures view #1 (fixes 55/85)
         .endif
 
         ; mouse
@@ -2602,17 +2984,16 @@ Main proc
                         or moved,al     ; SeekSoft 117; fix 101)
                 .endf
         .case 47h                       ; Home
-                xor al,al               ; enhanced keyboards deliver AL=E0h
-                .if (isFile)            ; for extended keys: force "no move"
-                        .if (curLine || hPos)
-                                mov curLine,0   ; so nothing moved is really
-                                mov hPos,0      ; nothing moved (fix 39)
-                                mov word ptr curPos,0
-                                mov word ptr curPos+2,0
-                                mov cCnt,0
-                                call SeekSoft
-                                mov al,1
-                        .endif
+                xor al,al
+                .if (isFile)
+                        mov curLine,0
+                        mov hPos,0
+                        mov word ptr curPos,0
+                        mov word ptr curPos+2,0
+                        mov cCnt,0
+                        mov vcValid,0
+                        call SeekSoft
+                        mov al,1
                 .else
                         ; STDIN (fix 85): Home jumps to the oldest line
                         ; the ring still holds - a pipe cannot rewind
@@ -2628,7 +3009,17 @@ Main proc
 @@hd:
                 .endif
         .case 4Fh                       ; End
-                .if (isFile)
+                .if (hexMode)           ; fix 177: the last hex ROW, not the
+                        HEXROWS          ; AX = hex rows (2.02b: was inline)
+                        sub ax,LINES_VIS
+                        jae @@hset
+                        xor ax,ax        ; dump fits the screen
+@@hset:                   cmp ax,curLine
+                        je @@hno
+                        mov curLine,ax
+                        mov al,1
+@@hno:
+                .elseif (isFile)
                         mov ax,totLines
                         cmp ax,LINES_VIS ; unsigned clamp (fix 31: 1.02 used
                         ja @F           ; a signed .if here and jumped to
@@ -2672,37 +3063,247 @@ Main proc
                 call PopUp
         .case 4Bh                       ; Left: one column left (fix 47)
                 xor al,al
-                .if (hPos)
+                .if (hPos && !wrapOn)     ; 2.02: no h-scroll in wrap mode
                         dec hPos
                         mov al,1
                 .endif
         .case 4Dh                       ; Right: one column right (47)
-                mov ax,hPos
-                .if (ax < HPOSMAX)
-                        inc hPos
-                        mov al,1
-                .else
-                        xor al,al
+                xor al,al
+                .if (!wrapOn)
+                        mov ax,hPos
+                        .if (ax < HPOSMAX)
+                                inc hPos
+                                mov al,1
+                        .endif
                 .endif
         .case 73h                       ; Ctrl+Left: ten columns (47)
                 xor al,al
-                .if (hPos > 10)
-                        sub hPos,10
-                        mov al,1
-                .elseif (hPos)
-                        mov hPos,0
-                        mov al,1
+                .if (!wrapOn)
+                        .if (hPos > 10)
+                                sub hPos,10
+                                mov al,1
+                        .elseif (hPos)
+                                mov hPos,0
+                                mov al,1
+                        .endif
                 .endif
         .case 74h                       ; Ctrl+Right: ten columns (47)
-                mov ax,hPos
-                .if (ax < HPOSMAX-10)
-                        add hPos,10
-                        mov al,1
-                .elseif (ax < HPOSMAX)
-                        mov hPos,HPOSMAX
-                        mov al,1
-                .else
+                xor al,al
+                .if (!wrapOn)
+                        mov ax,hPos
+                        .if (ax < HPOSMAX-10)
+                                add hPos,10
+                                mov al,1
+                        .elseif (ax < HPOSMAX)
+                                mov hPos,HPOSMAX
+                                mov al,1
+                        .endif
+                .endif
+        .case 19h
+                .if (al==10h)
+                        call PrintFile
                         xor al,al
+                .endif
+        .case 1Eh
+                .if (al==41h || al==61h)
+                        .if (srValid)
+                                mov srBack,0
+                                call DoSearch
+                        .endif
+                .endif
+        .case 21h
+                .if (al==46h || al==66h)
+                        mov si,offset sAskFind
+                        mov di,offset srPat
+                        mov cx,31
+                        call PopAsk
+                        .if (cx)
+                                mov srLen,cx
+                                mov srBack,0
+                                mov srCase,0
+                                mov srValid,1
+                                call DoSearch
+                        .endif
+                .endif
+        .case 1Fh
+                .if (al==53h || al==73h)
+                        mov si,offset sAskScan
+                        mov di,offset srPat
+                        mov cx,31
+                        call PopAsk
+                        .if (cx)
+                                mov srLen,cx
+                                mov srBack,0
+                                mov srCase,1
+                                mov srValid,1
+                                call DoSearch
+                        .endif
+                .endif
+        .case 2Bh
+                mov si,offset sAskFind
+                mov di,offset srPat
+                mov cx,31
+                call PopAsk
+                .if (cx)
+                        mov srLen,cx
+                        mov srBack,0
+                        mov srCase,0
+                        mov srValid,1
+                        call DoSearch
+                .endif
+        .case 35h
+                mov si,offset sAskScan
+                mov di,offset srPat
+                mov cx,31
+                call PopAsk
+                .if (cx)
+                        mov srLen,cx
+                        mov srBack,0
+                        mov srCase,1
+                        mov srValid,1
+                        call DoSearch
+                .endif
+        .case 29h
+                mov si,offset sAskFindB
+                mov di,offset srPat
+                mov cx,31
+                call PopAsk
+                .if (cx)
+                        mov srLen,cx
+                        mov srBack,1
+                        mov srCase,0
+                        mov srValid,1
+                        call DoSearch
+                .endif
+        .case 28h
+                mov si,offset sAskScanB
+                mov di,offset srPat
+                mov cx,31
+                call PopAsk
+                .if (cx)
+                        mov srLen,cx
+                        mov srBack,1
+                        mov srCase,1
+                        mov srValid,1
+                        call DoSearch
+                .endif
+        .case 07h
+                .if (al==5Eh)
+                        mov si,offset sAskFindB
+                        mov di,offset srPat
+                        mov cx,31
+                        call PopAsk
+                        .if (cx)
+                                mov srLen,cx
+                                mov srBack,1
+                                mov srCase,0
+                                mov srValid,1
+                                call DoSearch
+                        .endif
+                .endif
+        .case 2Fh                       ; V/v: back-scan (was V=stats, removed)
+                .if (al==56h || al==76h)
+                        mov si,offset sAskScanB
+                        mov di,offset srPat
+                        mov cx,31
+                        call PopAsk
+                        .if (cx)
+                                mov srLen,cx
+                                mov srBack,1
+                                mov srCase,1
+                                mov srValid,1
+                                call DoSearch
+                        .endif
+                .endif
+        .case 17h
+                .if (al==49h || al==69h)
+                        call ShowInfo
+                        xor al,al
+                .endif
+        .case 22h                       ; fix 181: G goes to a line - 2.00's
+                .if (al==47h || al==67h)  ; help promised "Ctrl+Home goto
+                        mov si,offset sAskGoto ; line N" with no handler
+                        mov di,offset srPat ; behind it; the parser and the
+                        mov cx,5              ; prompt existed unused
+                        call PopAsk
+                        .if (cx)
+                                mov si,offset srPat
+                                call AtoU
+                                .if (!carry?)
+                                        or ax,ax            ; typed 0 -> stay
+                                        jz @@gd             ; on line 1 (a 16-bit
+                                        dec ax              ; wrap of a huge
+@@gd:                                   mov dx,totLines     ; input must NOT
+                                                            ; floor: the clamp
+                                                            ; below catches it)
+                                        sub dx,LINES_VIS
+                                        jae @@gc
+                                        xor dx,dx          ; short file: top
+@@gc:                                   cmp ax,dx
+                                        jbe @@gk
+                                        mov ax,dx          ; clamp to the
+@@gk:                                   cmp ax,curLine     ; last top line
+                                        jne @@go
+                                        xor al,al          ; already there
+                                        jmp @@gn
+@@go:                                   mov curLine,ax
+                                        mov vcValid,0
+                                        call GoLine
+                                        mov al,1
+@@gn:
+                                .else
+                                        xor al,al
+                                .endif
+                        .else
+                                xor al,al
+                        .endif
+                .endif
+        .case 15h
+                .if (al==19h)
+                        call SetBm
+                        xor al,al
+                .elseif (al==0)
+                        call GotoBm
+                        mov al,1
+                .endif
+        .case 23h
+                .if (al==0 && isFile)   ; hex view needs a seekable file
+                        xor hexMode,1
+                        mov vcValid,0
+                        mov curLine,0
+                        mov hPos,0
+                        mov word ptr curPos,0
+                        mov word ptr curPos+2,0
+                        mov cCnt,0
+                        mov al,1
+                .endif
+        .case 3Dh
+                .if (srValid)
+                        mov srBack,0
+                        call DoSearch
+                .endif
+        .case 43h
+                .if (srValid)
+                        mov srBack,1
+                        call DoSearch
+                .endif
+        .case 11h                       ; 2.02: 'W' toggles word wrap
+                .if (al==57h || al==77h)
+                        xor wrapOn,1
+                        mov vcValid,0
+                        mov curLine,0
+                        mov hPos,0
+                        mov cCnt,0
+                        mov word ptr curPos,0
+                        mov word ptr curPos+2,0
+                        mov word ptr progSize,0
+                        mov word ptr progSize+2,0
+                        mov barCells,20          ; skip the completion hold
+                        call SeekSoft
+                        .if (isFile)
+                                call CountLines   ; recount with new wrap
+                        .endif
+                        mov al,1
                 .endif
         .default
                 xor al,al               ; unknown key: no repaint (fix 32)
@@ -2751,6 +3352,22 @@ MousePoll proc
                                         ; the thumb needs a seekable file:
                                         ; a pipe has no line N (fix 50)
                 dec dx                  ; thumb row 0..LINES_VIS-1
+                mov bx,dx               ; BX = clicked row (saved)
+                .if (hexMode)           ; fix 177: the thumb maps hex ROWS;
+                                        ; no text walk - HexDraw seeks per
+                                        ; row, so the jump is free
+                        HEXROWS         ; AX = hex rows (2.02b: was inline)
+                        cmp ax,LINES_VIS
+                        jbe @@done       ; dump fits: no travel
+                        sub ax,LINES_VIS
+                        xchg ax,bx       ; AX = clicked row, BX = travel
+                        mul bx           ; DX:AX = row*travel
+                        mov bx,LINES_VIS-1
+                        div bx           ; AX = target top row
+                        mov curLine,ax
+                        call Draw
+                        jmp @@wr
+                .endif
                 mov bx,totLines
                 cmp bx,LINES_VIS        ; unsigned: 0 lines or the whole
                 jbe @@done             ; file on screen -> no travel
@@ -2775,7 +3392,9 @@ MousePoll proc
                 mov ax,3
                 int 33h
                 test bl,1
-                jz @@wr
+                jnz @@wr                ; 2.02 fix: loop WHILE pressed (was jz -
+                                        ; the inversion made the click auto-repeat
+                                        ; and could hang if released mid-Draw)
 @@wrdone:
         .endif
 @@done: ret
@@ -2827,6 +3446,13 @@ ReadKey endp
 ;------------------------------------------------------------------------------
 ScrUp proc
         xor al,al
+        .if (hexMode)                  ; fix 177: hex rows, not text lines -
+                .if (curLine)        ; 2.00 ran the TEXT cache logic on a
+                        dec curLine        ; row index (and DrwUp1 then moved
+                        mov al,1            ; it a SECOND time via HexUp1)
+                .endif
+                ret
+        .endif
         .if (curLine==0)
                 ret                     ; on the first line already
         .endif
@@ -2945,6 +3571,24 @@ ScrUp endp
 ;------------------------------------------------------------------------------
 ScrDn proc
         xor al,al
+        .if (hexMode)                  ; fix 177: EOF is fileSize, not
+                mov ax,curLine        ; totLines - 2.00 blocked a binary's
+                add ax,LINES_VIS       ; hex view at its TEXT line count.
+                jc @@s                  ; 2.02 fix: curLine near 65535 wraps the
+                                        ; add - guard against it (was missing:
+                                        ; the text branch has jc @@s, hex didn't)
+                xor dx,dx              ; fix 191: the x16 goes through BX:
+                mov bx,16              ; Main's PgDn counts the loop in CX
+                mul bx                  ; and 2.00's "mov cx,16" reset it
+                cmp dx,word ptr fileSize+2   ; to 16 on every call - the
+                ja @@s                  ; loop never counted down: PgDn in
+                jb @@hdn                ; hex mode hung in an endless ScrDn
+                cmp ax,word ptr fileSize
+                jae @@s
+@@hdn:          inc curLine
+                mov al,1
+                ret
+        .endif
         .if (isFile)
                 mov ax,curLine
                 add ax,LINES_VIS
@@ -2952,7 +3596,11 @@ ScrDn proc
                 cmp ax,totLines         ; unsigned: bottom reached (fix 23)
                 jae @@s
                 call CachePos
-                call RdLine
+                mov cntMode,1           ; 2.02d: consume-only RdLine - ScrDn only
+                call RdLine             ; needs the next line start (EOF check +
+                mov cntMode,0           ; reader advance), not the text. The
+                                        ; store scanner was ~44 cyc/byte, consume
+                                        ; is ~22 - 2x faster, matching Up's speed
                 or al,al
                 jz @@s
                 inc curLine
@@ -3010,6 +3658,12 @@ ScrDn endp
 ; an Up is still hot.
 ;------------------------------------------------------------------------------
 DrwUp1 proc
+        .if (hexMode)
+                call HexDraw            ; fix 177: movement already happened
+                call DrwBar             ; in ScrUp - paint only
+                call DrwSt
+                ret
+        .endif
         push es
         mov ax,vSeg
         mov es,ax
@@ -3036,7 +3690,8 @@ DrwUp1 proc
                 and bx,31
                 shl bx,2                       ; BX = (curLine and 31)*4: vPos
                 VPSTORE bx                     ; entry (fix 64: no [DX] on 8086)
-                .if (vcValid && vcTop==curLine+1)
+                mov ax,vcTop                   ; fix 183: the compare goes
+                .if (vcValid != 0 && ax==curLine+1) ; through a register -
                         ; hot (fix 64): the new top line takes the slot the old
                         ; bottom line (vcTop+22, slots are line mod 23) just left
                         dec vSlot                       ; slot -1, 22 <- 0FFh
@@ -3087,6 +3742,12 @@ DrwUp1 endp
 ; ring - paint that slot, nothing is re-read from the pipe.
 ;------------------------------------------------------------------------------
 DrwDn1 proc
+        .if (hexMode)
+                call HexDraw            ; fix 177: movement already happened
+                call DrwBar             ; in ScrDn - paint only
+                call DrwSt
+                ret
+        .endif
         push es
         mov ax,vSeg
         mov es,ax
@@ -3108,7 +3769,8 @@ DrwDn1 proc
         .if (isFile)
                 ; the scan below advances curPos: save it first
                 SAVEPOS savPos
-                .if (vcValid && vcTop==curLine-1)
+                mov ax,vcTop                   ; fix 183: register compare
+                .if (vcValid != 0 && ax==curLine-1)
                         ; hot (fix 64): vPos knows where the new bottom
                         ; line starts - ONE parse, zero extra reads. The
                         ; new bottom (line curLine+22) lands in the slot
@@ -3253,13 +3915,18 @@ WrCntRow proc
         mov cl,LINEWID                  ; window start on (99); CL =
         sub cl,al                       ; pad cells, CF=1: full row
         mov ah,ATTR_CONT
-        mov bh,ATTR_CONT                ; fix 143: the pair loops build
-        push bx                         ; BOTH cells from one LODSW (BH
-        jc @@full                       ; carries the attribute; BX is the
-        add si,hPos                     ; callers' slot cursor, hence the
-        mov ch,0                        ; push/pop - DX/BP are never
-        push cx                         ; touched). ~63 instead of ~73
-        mov cl,al                       ; cycles per pair on an 8086
+        push bx                         ; fix 191: save the caller's slot
+        mov bh,ATTR_CONT                ; cursor BEFORE loading BH - fix
+        jc @@full                       ; 143 placed the push one line too
+                                        ; late, so every call returned with
+                                        ; BX = 1Fxx: the slot cursor stuck,
+                                        ; cold fills parsed rows over the
+                                        ; program's own state block (the
+                                        ; 1.14-1.35 builds shipped it)
+        add si,hPos
+        mov ch,0
+        push cx                         ; the pad count waits on the stack
+        mov cl,al                       ; while the pairs paint
         shr cx,1                        ; pairs, CF = odd char (fix 120:
         jnc @@pe                        ; two per iteration - the 77-char
         lodsb                           ; odd char goes first
@@ -3525,8 +4192,8 @@ RdLine proc uses bx cx dx si di bp
 
         ; --- fast path: straight from bBuf (fix 41) ---
         xor bp,bp                       ; 0: storing, 1: consume-only
-        .if (cntMode)                   ; 1.06: count pass stores nothing
-                mov bp,1                ; (fix 49), EOF sniffing moved out
+        .if (cntMode && !wrapOn)        ; 2.02: wrap uses the store scanner
+                mov bp,1                ; even in count mode (capacity = LINEWID)
         .endif
         mov si,offset bBuf
         add si,bIdx
@@ -3559,7 +4226,11 @@ RdLine proc uses bx cx dx si di bp
         sub ax,si                       ; bytes left in the block
         jz @@refill                     ; block consumed: refill
         mov cx,wDest
-        add cx,LBUFCAP                  ; target end: lBuf or a vCache
+        .if (wrapOn)                   ; 2.02: wrap caps at LINEWID
+                add cx,LINEWID
+        .else
+                add cx,LBUFCAP          ; target end: lBuf or a vCache
+        .endif
         sub cx,di                       ; slot (fix 63): capacity left
         jz @@sful                       ; full line: consume the rest
         cmp ax,cx
@@ -3665,7 +4336,11 @@ RdLine proc uses bx cx dx si di bp
         je @@cr4e                       ; CRLF: eat it (canonical)
         jmp @@lfx                       ; CR only: SI already right
 @@l2:   jmp @@lfx                       ; P2 LF: consumed
-@@sful: mov ax,bx
+@@sful: .if (wrapOn)                   ; 2.02: wrap stops at LINEWID - the
+                mov dx,1              ; rest of the logical line becomes the
+                jmp @@donef           ; next visual row (no consume pass)
+        .endif
+        mov ax,bx
         sub ax,si
         mov bp,1                        ; lBuf full: consume the rest
         ; fall through to the consume-only scanner
@@ -3913,9 +4588,15 @@ Draw proc
                 mov ax,2
                 int 33h
         .endif
-        call DrwCnt
-        call DrwBar
-        call DrwSt
+        .if (hexMode)
+                call HexDraw
+                call DrwBar
+                call DrwSt
+        .else
+                call DrwCnt
+                call DrwBar
+                call DrwSt
+        .endif
         .if (mPres)
                 mov ax,1
                 int 33h
@@ -4007,7 +4688,8 @@ DrwFrm endp
 ; is padded - EOF rows are cleared explicitly.
 ;------------------------------------------------------------------------------
 DrwCnt proc uses ax bx cx dx si di bp
-        .if (!isFile || (vcValid && curLine==vcTop))
+        mov ax,curLine                  ; fix 183: register compare
+        .if (!isFile || (vcValid != 0 && ax==vcTop))
                 ; the merged buffer already holds this view (fix 85):
                 ; STDIN's ring, or the file view-cache hit (fix 63) -
                 ; paint the slots, zero file access
@@ -4098,24 +4780,34 @@ DrwBar proc uses ax bx cx di
                 mov es:[di],ax
                 add di,160
         .untilcxz
+        ; 2.02: hex mode computes hexRows = (fileSize+15)/16 then uses
+        ; the SAME thumb code as text mode. The old hex branch had a
+        ; jbe @@f that jumped to @@hcap (the next @@ label) instead of
+        ; the full-thumb @@f in the text section - a label resolution
+        ; bug that broke the thumb for small files and complicated the
+        ; code for no benefit.
         mov ax,totLines
+        .if (hexMode)
+                HEXROWS                 ; AX = hex rows (2.02b: was inline)
+        .endif
+        ; AX = effective total (totLines text / hexRows hex)
         or ax,ax
         jz @@d
-        cmp ax,LINES_VIS        ; unsigned: whole file on screen? The
-        jbe @@f                 ; signed 1.02 .if failed at the 65.535
-        mov ax,curLine          ; saturation point (fix 23)
-        FastMul 22              ; DX:AX = curLine*22, no MUL (fixes
-                                ; 35/92: the 1.13 -3-only MOVZX+IMUL
-                                ; inline never wrote DX and the DIV
-                                ; read a garbage high word)
-        mov bx,totLines
-        sub bx,LINES_VIS                ; >= 1 here (fix 159: the jbe above
-        div bx                          ; routed totLines <= 23 to the full
-                                        ; thumb, so the old jz never fired);
-                                        ; variable divisor: DIV stays
-        .if (ax>=LINES_VIS)
-                mov ax,LINES_VIS-1
-        .endif
+        cmp ax,LINES_VIS        ; unsigned: whole file on screen?
+        jbe @@f
+        ; 2.02a fix: save effective total on STACK, not in BX -
+        ; FastMul 22 may use BX as a temp on the 8086 build (shift-and-add
+        ; for 22=16+4+2 needs a temp register), and saving in BX before
+        ; FastMul left garbage in the divisor → #DE → hang.
+        push ax                 ; save effective total on stack
+        mov ax,curLine
+        FastMul 22              ; DX:AX = curLine*22
+        pop bx                  ; BX = effective total (safe from FastMul)
+        sub bx,LINES_VIS        ; BX = effective total - LINES_VIS (>= 1)
+        div bx                  ; AX = thumb row (0..LINES_VIS-1)
+        ; 2.02c: removed dead .if (ax>=LINES_VIS) clamp - the quotient
+        ; is bounded to 0..22 because curLine <= effective_total-LINES_VIS
+        ; so curLine*22/(eff-LINES_VIS) <= 22 (same class as fix 159)
         ; DI = AX*160 without MUL: (AX<<7)+(AX<<5)  (fix 13)
         mov di,ax
         shl di,5                        ; *32
@@ -4148,6 +4840,45 @@ DrwBar endp
 DrwSt proc uses ax bx cx dx si di
         push ds
         pop es                          ; ES=DS: stBuf is a data buffer
+        .if (hexMode)                   ; 2.02: hex mode shows byte offset
+                mov di,offset stBuf     ; and byte-based percentage, not
+                mov si,offset sOff      ; text line numbers
+                call Cpy
+                ; byte offset = curLine << 4 (shifts, not mul)
+                mov ax,curLine
+                xor dx,dx
+                shl ax,1
+                rcl dx,1
+                shl ax,1
+                rcl dx,1
+                shl ax,1
+                rcl dx,1
+                shl ax,1
+                rcl dx,1
+                call U2A32              ; 32-bit decimal
+                mov al,'/'
+                stosb
+                mov ax,word ptr fileSize
+                mov dx,word ptr fileSize+2
+                call U2A32
+                mov ax,'  '
+                stosw
+                ; percentage = curLine*100 / hexRows
+                HEXROWS                 ; AX = hex rows (2.02b: was inline)
+                or ax,ax
+                jz @@np                  ; empty file
+                ; 2.02a fix: save hexRows on STACK, not BX - FastMul 100
+                ; may clobber BX on the 8086 build (same bug as DrwBar)
+                push ax                  ; save hexRows on stack
+                mov ax,curLine
+                FastMul 100
+                pop bx                   ; BX = hexRows (safe from FastMul)
+                div bx
+                call U2A
+                mov al,'%'
+                stosb
+                jmp @@np
+        .endif
         mov di,offset stBuf
         mov si,offset sLn
         call Cpy
@@ -4532,6 +5263,906 @@ U2A proc uses bx cx dx si
         endif
 U2A endp
 
+;==============================================================================
+; 2.00 NEW PROCS
+;==============================================================================
+
+PopAsk proc uses bx dx si di bp
+        mov askMax,cx
+        mov word ptr askBuf,di
+        mov word ptr askCnt,0
+        mov bp,40
+        mov ax,78
+        sub ax,bp
+        shr ax,1
+        mov popCol,ax
+        mov ax,21
+        sub ax,4
+        shr ax,1
+        mov popRow,ax
+        mov di,popRow
+        shl di,5
+        mov ax,di
+        shl ax,2
+        add di,ax
+        mov ax,popCol
+        shl ax,1
+        add di,ax
+        mov popOff,di
+        .if (mPres)
+                mov ax,2
+                int 33h
+        .endif
+        mov dx,4
+        push es, ds                   ; the save loop - SI becomes its video
+        push si                       ; cursor, so fix 173 parks the prompt
+        mov si,popOff                 ; pointer on the stack: 2.00 painted
+        mov ax,vSeg                   ; the prompt row from CODE BYTES
+        mov ds,ax                     ; (garbage) once the loop was done
+        mov ax,ss
+        mov es,ax
+        mov di,offset popSave
+        .repeat
+                mov cx,bp
+                add cx,2
+                add cx,cx
+                BLKCP
+                AdvRow si
+                dec dx
+        .untilz
+        pop si                        ; fix 173: the prompt pointer back
+        pop ds
+        mov ax,vSeg
+        mov es,ax
+        mov di,popOff
+        mov ax,A_POP or 0C9h
+        stosw
+        mov al,0CDh
+        mov cx,bp
+        rep stosw
+        mov al,0BBh
+        stosw
+        AdvRow di
+        mov ah,ATTR_POP
+        mov al,0BAh
+        stosw
+        mov cx,bp
+@@pl:   mov al,[si]
+        or al,al
+        jz @@pd
+        stosw
+        inc si
+        loop @@pl
+@@pd:   mov al,' '
+        rep stosw
+        mov al,0BAh
+        stosw
+        AdvRow di
+        mov ah,ATTR_POP
+        mov al,0BAh
+        stosw
+        mov ax,A_POP or ' '
+        mov cx,bp
+        rep stosw
+        mov al,0BAh
+        stosw
+        AdvRow di
+        mov ah,ATTR_POP
+        mov al,0C8h
+        stosw
+        mov al,0CDh
+        mov cx,bp
+        rep stosw
+        mov al,0BCh
+        stosw
+@@in:   call ReadKey
+        .if (al==0Dh)
+                jmp @@done
+        .endif
+        .if (al==1Bh)
+                mov word ptr askCnt,0
+                jmp @@done
+        .endif
+        .if (al==8)
+                mov ax,word ptr askCnt
+                or ax,ax
+                jz @@in
+                dec word ptr askCnt
+                call AskPaint
+                jmp @@in
+        .endif
+        mov dl,al                   ; fix 186: park the CHARACTER - 2.00
+        mov ax,word ptr askCnt     ; loaded askCnt into AX first, so the
+        cmp ax,askMax              ; "mov [bx],al" store wrote the COUNTER
+        jae @@in                   ; (00 01 02 ...) instead of the typed
+        mov bx,word ptr askBuf    ; text: every search pattern and every
+        add bx,ax                  ; goto number was garbage
+        mov [bx],dl
+        inc word ptr askCnt
+        call AskPaint
+        jmp @@in
+@@done: mov cx,word ptr askCnt
+        mov bx,word ptr askBuf
+        add bx,cx
+        mov byte ptr [bx],0
+        mov ax,vSeg
+        mov es,ax
+        mov di,popOff
+        mov si,offset popSave
+        mov dx,4
+        .repeat
+                mov cx,bp
+                add cx,2
+                add cx,cx
+                BLKCP
+                AdvRow di
+                dec dx
+        .untilz
+        .if (mPres)                   ; show the mouse BEFORE snapping CX:
+                mov ax,1              ; 2.02: INT 33h AX=1 should preserve CX
+                int 33h               ; but some clone drivers are sloppy -
+        .endif                        ; reload the count LAST so it is safe
+        mov cx,word ptr askCnt        ; fix 188: AdvRow leaves 156-2*BP in CX
+                                        ; - 2.00 returned that instead of the
+                                        ; count, so srLen took garbage values
+        pop es
+        ret
+PopAsk endp
+
+AskPaint proc uses ax bx cx dx si di
+        mov es,vSeg
+        mov di,popRow
+        add di,2
+        shl di,5
+        mov ax,di
+        shl ax,2
+        add di,ax
+        mov ax,popCol
+        inc ax
+        shl ax,1
+        add di,ax
+        mov cx,40
+        mov bx,word ptr askBuf
+        mov si,0
+        mov ah,ATTR_POP
+@@l:    mov al,[bx+si]
+        or al,al
+        jz @@bl
+        stosw
+        inc si
+        loop @@l
+        jmp @@pd2
+@@bl:   mov al,' '
+        rep stosw
+@@pd2:  ret
+AskPaint endp
+
+AtoU proc uses bx cx dx
+        xor bx,bx
+        xor cx,cx
+@@l:    mov al,[si]
+        cmp al,'0'
+        jb @@d
+        cmp al,'9'
+        ja @@d
+        sub al,'0'
+        cbw
+        xchg ax,bx
+        mov cx,10
+        mul cx
+        add ax,bx
+        xchg ax,bx
+        inc si
+        jmp @@l          ; 2.02b: removed dead "inc cx" (cx was set to 10
+                         ; by "mov cx,10" above, inc made it 11 but the
+                         ; "mov cx,10" on the next iteration reset it)
+@@d:    mov ax,bx
+        or cx,cx
+        stc
+        jz @@e
+        clc
+@@e:    ret
+AtoU endp
+
+
+U2A32 proc uses ax bx cx dx si
+        mov si,10
+        xor cx,cx
+@@l:    push ax
+        mov ax,dx
+        xor dx,dx
+        div si
+        mov bx,ax
+        pop ax
+        div si
+        push dx
+        mov dx,bx
+        or bx,ax                       ; fix 172: test the 32-bit quotient
+        jz @@e                         ; WITHOUT destroying DX:AX - BX holds
+        inc cx                         ; the high quotient and is dead here.
+        jmp @@l                        ; 2.00's "or dx,ax" left DX = high|low
+                                        ; and the next iteration divided the
+                                        ; mangled pair: the value never hit
+                                        ; 0:0, the loop pushed one word per
+                                        ; round until SP walked through the
+                                        ; whole segment and the program
+                                        ; itself - 'I' and 'V' hung the
+                                        ; viewer (the reported cuelgue)
+@@e:    inc cx
+@@o:    pop ax
+        add al,'0'
+        stosb
+        loop @@o
+        ret
+U2A32 endp
+
+ShowInfo proc
+        push ax
+        push bx
+        push cx
+        push dx
+        push di
+        push si
+        push es
+        push ds
+        pop es
+        ; Build the info lines into infoBuf (7 slots of 80 bytes each).
+        ; PopLine clips to the popup width, so overflow is safe.
+        ; Line 1: "File: <name>"
+        mov di,offset infoBuf
+        mov si,offset sIFile
+        call Cpy
+        mov si,offset fName
+        .if (!isFile)
+                mov si,offset sSTDIN
+        .endif
+        call Cpy
+        mov byte ptr [di],0
+        ; Line 2: "Size: <bytes> bytes"
+        mov di,offset infoBuf+80
+        mov si,offset sSize
+        call Cpy
+        mov ax,word ptr fileSize
+        mov dx,word ptr fileSize+2
+        call U2A32
+        mov si,offset sBytes
+        call Cpy
+        mov byte ptr [di],0
+        ; Line 3: "Date: <dd-mm-yyyy hh:mm>" (file date/time, INT 21h 5700h)
+        mov di,offset infoBuf+160
+        .if (isFile)
+                mov bx,hFile
+                mov ax,5700h
+                int 21h
+                .if (!carry?)
+                        mov svDate,cx
+                        mov svTime,dx
+                        mov si,offset sIDate
+                        call Cpy
+                        mov bx,svDate        ; cache in BX (U2A preserves it)
+                        mov ax,bx
+                        and ax,1Fh            ; day of month
+                        call U2A
+                        mov al,'-'
+                        stosb
+                        mov ax,bx
+                        shr ax,5              ; month (SMART.INC: faster than mov cl,5)
+                        and ax,0Fh
+                        call U2A
+                        mov al,'-'
+                        stosb
+                        mov ax,bx
+                        shr ax,9              ; year - 1980 (SMART.INC macro)
+                        add ax,1980
+                        call U2A
+                        mov al,' '
+                        stosb
+                        mov bx,svTime         ; cache in BX
+                        mov ax,bx
+                        shr ax,11             ; hour (SMART.INC macro)
+                        call U2A
+                        mov al,':'
+                        stosb
+                        mov ax,bx
+                        shr ax,5              ; minute
+                        and ax,3Fh
+                        call U2A
+                .endif
+        .endif
+        mov byte ptr [di],0
+        ; Line 4: "Lines: <totLines>"
+        mov di,offset infoBuf+240
+        mov si,offset sILines
+        call Cpy
+        mov ax,totLines
+        call U2A
+        mov byte ptr [di],0
+        ; Line 5: "Position: line <curLine+1>"
+        mov di,offset infoBuf+320
+        mov si,offset sIPos
+        call Cpy
+        mov ax,curLine
+        inc ax
+        call U2A
+        mov byte ptr [di],0
+        ; Line 6: blank
+        mov byte ptr infoBuf+400,0
+        ; Line 7: mode
+        mov di,offset infoBuf+480
+        .if (hexMode)
+                mov si,offset sIHex
+        .else
+                mov si,offset sIText
+        .endif
+        call Cpy
+        mov byte ptr [di],0
+        ; Show the popup (7 lines, width 44)
+        mov bx,offset infoTab
+        mov cx,7
+        mov dx,44
+        call PopUp
+        pop es
+        pop si
+        pop di
+        pop dx
+        pop cx
+        pop bx
+        pop ax
+        ret
+ShowInfo endp
+
+PrintFile proc
+        .if (!isFile)
+                ret
+        .endif
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        push es
+        SAVEPOS prnSave               ; fix 178: saved before anything can
+        mov dx,offset sPRN            ; fail, restored on every exit - the
+        mov ax,3D01h                  ; 2.00 error paths returned with the
+        int 21h                       ; reader anchored at BOF while curPos
+        jc @@err                      ; still pointed at the view, so the
+        mov word ptr prnH,ax          ; next refill served the file's top
+        mov bx,hFile
+        xor cx,cx
+        xor dx,dx
+        mov ax,4200h
+        int 21h
+        mov word ptr bBase,0
+        mov word ptr bBase+2,0
+        mov bLen,0
+        mov bIdx,0
+        mov hFull,0
+@@l:    mov bx,hFile
+        mov ah,3Fh
+        mov dx,offset bBuf
+        mov cx,BUFSZ
+        int 21h
+        jc @@err2
+        or ax,ax
+        jz @@eof
+        mov cx,ax
+        mov bx,word ptr prnH
+        mov ah,40h
+        mov dx,offset bBuf
+        int 21h
+        jc @@err2
+        jmp @@l
+@@eof:  mov bx,word ptr prnH
+        mov ah,40h
+        mov dx,offset sFF
+        mov cx,1
+        int 21h
+        mov bx,word ptr prnH
+        mov ah,3Eh
+        int 21h
+        RESTPOS prnSave
+        call SeekSoft
+        jmp @@pf_exit
+@@err2: mov bx,word ptr prnH
+        mov ah,3Eh
+        int 21h
+@@err:  RESTPOS prnSave               ; fix 178
+        call SeekSoft
+        mov bx,offset errTab
+        mov cx,3
+        mov dx,30
+        call PopUp
+@@pf_exit:
+        pop es
+        pop di
+        pop si
+        pop dx
+        pop cx
+        pop bx
+        pop ax
+        ret
+PrintFile endp
+
+DoSearch proc
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        push bp
+        .if (!isFile || !srValid)
+                xor al,al
+                jmp @@ds_exit
+        .endif
+        SAVEPOS srSave
+        mov ax,curLine
+        .if (srBack)
+                or ax,ax
+                jz @@nf                  ; on line 0: nothing above
+                xor ax,ax                ; fix 174: back scans from BOF and
+        .else                          ; keeps the LAST match < curLine
+                inc ax
+                cmp ax,totLines
+                jae @@nf            ; 2.02b fix: UNSIGNED (was .if SIGNED -
+                                    ; files >= 32768 lines read totLines as
+                                    ; negative, so the forward search from
+                                    ; any early line silently reported "not
+                                    ; found" without scanning a single line)
+        .endif
+        ; ---- walk to the scan's first line. FIX 174: BX counts ABSOLUTE
+        ; lines from here on. 2.00 counted from 0 while the reader was
+        ; already positioned past curLine lines, so every match was
+        ; recorded as a BX-relative "line" and a forward hit could land
+        ; the view nowhere (a word on every line reported a match that
+        ; moved nothing).
+        ; FIX 190: the walk count was read as "mov cx,ax" AFTER
+        ; "call SeekSoft" - which clobbers AX - so the walk count was
+        ; SeekSoft's leftover (0 for any file under 64 KiB): the walk
+        ; never walked, the scan read line 0 while BX said curLine+1,
+        ; and every recorded line number was one past the truth.
+        mov cx,ax                     ; start line (0 back / curLine+1
+        mov di,ax                     ; fwd), captured BEFORE SeekSoft.
+                                        ; fix 192: the line counter rides
+                                        ; in DI - CachePos clobbers BX (its
+                                        ; cache-slot index) and 2.00's BX
+                                        ; counter was garbage after the walk
+        mov word ptr curPos,0
+        mov word ptr curPos+2,0
+        mov cCnt,0
+        call SeekSoft
+        mov cntMode,1
+        .while (cx)
+                call CachePos
+                call RdLine
+                .break .if (!al)
+                dec cx
+        .endw
+        mov cntMode,0
+        mov wDest,offset lBuf
+        mov bp,0FFFFh                 ; DI = the line the reader sits on
+@@l:    KeyAvail
+        jz @@cont
+        push ds
+        xor ax,ax
+        mov ds,ax
+        mov si,ds:[0041Ah]
+        mov ax,ds:[si+0400h]
+        cmp ax,011Bh
+        pop ds
+        jz @@abort
+        push ds
+        xor ax,ax
+        mov ds,ax
+        mov si,ds:[0041Ah]
+        add si,2
+        cmp si,003Eh
+        jb @@c1
+        mov si,001Eh
+@@c1:   mov ds:[0041Ah],si
+        pop ds
+@@cont: call RdLine                    ; 2.02: dead SAVEPOS srSave2 removed
+                                        ; (srSave2 was written but never read)
+        .if (!al)
+                jmp @@done
+        .endif
+        mov si,offset lBuf
+        mov cx,srLen
+        call MatchStr
+        .if (al)
+                .if (srBack)
+                        mov bp,di      ; keep the highest match below
+                .else                 ; the view: the scan ends there
+                        mov bp,di
+                        jmp @@done
+                .endif
+        .endif
+@@skip: inc di
+        .if (srBack)                  ; fix 174: the back scan stops at the
+                cmp di,curLine        ; view's line - 2.00 walked to EOF
+                jae @@done
+        .endif
+        .if (di == 0FFFFh)
+                jmp @@done
+        .endif
+        jmp @@l
+@@done: mov cntMode,0
+        mov wDest,offset lBuf
+        cmp bp,0FFFFh
+        je @@nf
+        mov curLine,bp
+        mov vcValid,0
+        mov word ptr curPos,0
+        mov word ptr curPos+2,0
+        mov cCnt,0
+        call SeekSoft
+        mov cx,bp
+        mov cntMode,1
+        .while (cx)
+                call CachePos
+                call RdLine
+                .break .if (!al)
+                dec cx
+        .endw
+        mov cntMode,0
+        mov al,1                      ; fix 176: NO curPos reset after the
+        jmp @@ds_exit                 ; walk - it left the reader ON the
+                                        ; found line; 2.00's copy-pasted
+                                        ; "curPos=0 / SeekSoft" re-anchored
+                                        ; at BOF and the view showed lines
+                                        ; 0..22 labelled as the hit
+@@abort:mov cntMode,0
+        mov wDest,offset lBuf
+        RESTPOS srSave                ; fix 175: the abort exit left curPos
+        call SeekSoft                 ; deep inside the scan while curLine
+        xor al,al                     ; stayed put - the next Down painted
+        jmp @@ds_exit                 ; middle-of-file lines. Re-anchor.
+@@nf:   RESTPOS srSave
+        call SeekSoft
+        mov bx,offset nfTab
+        mov cx,3
+        mov dx,28
+        call PopUp
+        xor al,al
+@@ds_exit:
+        pop bp
+        pop di
+        pop si
+        pop dx
+        pop cx
+        pop bx
+        ret
+DoSearch endp
+
+MatchStr proc
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        .if (cx == 0)
+                xor al,al
+                jmp @@ms_exit
+        .endif
+        mov bx,si
+@@outer:
+        mov si,bx
+        mov di,0
+@@inner:
+        lodsb
+        or al,al
+        jz @@nofound
+        mov dl,srPat[di]
+        .if (srCase)
+                cmp al,dl
+        .else
+                call UpCase
+                mov dh,al
+                mov al,dl
+                call UpCase
+                cmp al,dh
+        .endif
+        jne @@advance
+        inc di
+        cmp di,cx
+        jb @@inner
+        mov al,1
+        jmp @@ms_exit
+@@advance:
+        inc bx
+        mov al,[bx]
+        or al,al
+        jnz @@outer
+@@nofound:
+        xor al,al
+@@ms_exit:
+        pop di
+        pop si
+        pop dx
+        pop cx
+        pop bx
+        ret
+MatchStr endp
+
+UpCase proc
+        cmp al,'a'
+        jb @@d
+        cmp al,'z'
+        ja @@d
+        sub al,20h
+@@d:    ret
+UpCase endp
+
+SetBm proc
+        mov ax,curLine
+        mov bmLine,ax
+        mov ax,hPos
+        mov bmHPos,ax
+        mov bmValid,1
+        ret
+SetBm endp
+
+GotoBm proc
+        .if (!bmValid)
+                ret
+        .endif
+        mov ax,bmLine
+        mov curLine,ax
+        mov ax,bmHPos
+        mov hPos,ax
+        mov vcValid,0
+        .if (hexMode)           ; fix 177: hex rows address directly -
+                xor al,al            ; HexDraw seeks per row, no text walk
+                ret
+        .endif
+        call GoLine
+        ret
+GotoBm endp
+
+DetectBinary proc
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        push es
+        .if (!isFile)
+                jmp @@exit
+        .endif
+        push ds
+        pop es
+        ; fix 179: Init leaves the fresh reader at BOF (DOS pointer =
+        ; bBase = curPos = 0, bLen = 0) - 2.00 seeked to BOF twice for
+        ; nothing. The probe reads through GetByte/FillBuf, so the first
+        ; 32 KiB block STAYS buffered and CountLines scans it without
+        ; paying a single extra DOS read.
+        mov di,offset hxBuf
+        mov cx,512
+@@rl:   call GetByte            ; OPT: GetByte preserves CX (only BX,AX;
+        jc @@done               ; FillBuf saves CX via uses) - push/pop
+        mov [di],al             ; was redundant
+        inc di
+        loop @@rl
+@@done: mov cx,di
+        sub cx,offset hxBuf
+        .if (cx == 0)
+                jmp @@rst
+        .endif
+        mov di,cx
+        mov si,offset hxBuf
+        xor dx,dx
+@@cl:   lodsb
+        cmp al,9
+        jb @@bin                   ; 0..8: control
+        cmp al,13
+        jbe @@ok                   ; 9..13: TAB/LF/VT/FF/CR
+        cmp al,20h
+        jb @@bin                   ; 14..31: control
+        cmp al,7Eh
+        jbe @@ok                   ; 32..126: printable
+@@bin:  inc dx                     ; fix 179: >= 7Fh counts too - 2.00's
+@@ok:   loop @@cl                  ; "jbe/jmp ok" made EVERY byte "ok" and
+                                        ; a file of pure FFh was "text"
+        mov ax,dx
+        mov bx,20
+        mul bx
+        cmp ax,di
+        jb @@rst
+        mov binFile,1
+@@rst:  mov bIdx,0                  ; fix 179: rewind INSIDE the buffered
+        mov hFull,0                 ; block: no seek, no refill - CountLines
+        mov word ptr curPos,0       ; reuses the block the probe loaded
+        mov word ptr curPos+2,0
+@@exit: pop es
+        pop di
+        pop si
+        pop dx
+        pop cx
+        pop bx
+        pop ax
+        ret
+DetectBinary endp
+
+HexDraw proc uses ax bx cx dx si di bp
+        ; 2.02: complete rewrite. The 2.01 HexDraw had three defects
+        ; visible in the screenshot: (a) the separate 23-row clear loop
+        ; painted cols 1-77 but the per-row paint then wrote from col 1
+        ; again with stosw whose DI was recomputed from BP - rows past
+        ; EOF were left as the clear's spaces but the address column
+        ; of data rows showed "0000" because curPos was read AFTER
+        ; GetByte had advanced bIdx through 16 bytes and the reader's
+        ; curPos invariant (bBase+bIdx) had drifted from the row start
+        ; stored in @@read; (b) no ASCII gutter was painted when the
+        ; hex-byte loop's stosw count miscalculated the column budget;
+        ; (c) DrwSt showed text-line numbers (meaningless in hex mode).
+        ; The rewrite paints one row per iteration: compute offset,
+        ; blank the row if past EOF, else seek+read+paint in one pass.
+        ; The address is captured BEFORE GetByte touches the reader.
+        mov es,vSeg
+        xor bp,bp
+@@row:  ; byte offset = (curLine + bp) * 16 = (curLine+bp) << 4
+        if USE386
+        ; OPT: 386 native 32-bit ops - movzx zero-extends both operands
+        ; so curLine+bp cannot overflow 32 bits; one shl eax,4 replaces
+        ; 4 shl/rcl pairs (~40 cycles saved per row, ~920 per hex frame)
+        movzx   eax,word ptr curLine
+        movzx   edx,bp
+        add     eax,edx               ; eax = curLine+bp (32-bit)
+        shl     eax,4                 ; eax = (curLine+bp) * 16
+        cmp     eax,dword ptr fileSize
+        jae     @@blank               ; past EOF
+        mov     dword ptr curPos,eax  ; capture BEFORE GetByte moves reader
+        else
+        mov     ax,curLine
+        add     ax,bp
+        mov     dx,0              ; 2.02b: MOV (not xor) preserves CF from add
+        adc     dx,0              ; propagate carry if curLine+bp > 65535
+        shl     ax,1             ; x2
+        rcl     dx,1
+        shl     ax,1             ; x4
+        rcl     dx,1
+        shl     ax,1             ; x8
+        rcl     dx,1
+        shl     ax,1             ; x16
+        rcl     dx,1
+        ; past EOF? -> blank row
+        cmp     dx,word ptr fileSize+2
+        ja      @@blank
+        jb      @@read
+        cmp     ax,word ptr fileSize
+        jae     @@blank
+@@read: ; capture the row's byte offset BEFORE GetByte moves the reader
+        mov     word ptr curPos,ax
+        mov     word ptr curPos+2,dx
+        endif
+        call SeekSoft
+        mov di,offset hxBuf
+        mov cx,16
+@@rl:   call GetByte            ; OPT: GetByte preserves CX (only clobbers
+        jc @@pad                ; BX,AX; FillBuf saves CX via uses list) -
+                                ; the push/pop was redundant
+        mov [di],al
+        inc di
+        if USE386
+        dec cx
+        jnz @@rl
+        else
+        loop @@rl
+        endif
+        jmp @@paint
+@@pad:  xor al,al
+@@padl: mov [di],al
+        inc di
+        if USE386
+        dec cx
+        jnz @@padl
+        else
+        loop @@padl
+        endif
+@@paint:
+        ; video offset = 160 + 2 + bp*160 = 162 + (bp<<7) + (bp<<5)
+        mov ax,bp
+        shl ax,5                 ; bp*32
+        mov di,ax
+        shl ax,2                 ; bp*128
+        add di,ax               ; di = bp*160
+        add di,160+2
+        ; address: 8 hex digits from the captured curPos (untouched by
+        ; GetByte - it lives in memory, read here after the read loop)
+        mov ax,word ptr curPos
+        mov dx,word ptr curPos+2
+        mov cx,ax               ; park low word in CX (HexB preserves CX)
+        mov ah,ATTR_CONT        ; attribute for the whole row
+        mov al,dh
+        call HexB               ; bits 24-31
+        mov al,dl
+        call HexB               ; bits 16-23
+        mov al,ch
+        call HexB               ; bits 8-15
+        mov al,cl
+        call HexB               ; bits 0-7
+        ; separator: 2 spaces
+        mov al,' '
+        stosw
+        stosw
+        ; 16 hex bytes, each "XX " (2 hex digits + 1 space)
+        mov si,offset hxBuf
+        mov cx,16
+@@bl:   lodsb
+        call HexB
+        mov al,' '
+        stosw
+        if USE386
+        dec cx
+        jnz @@bl
+        else
+        loop @@bl
+        endif
+        ; ASCII gutter: 16 chars, unprintables -> '.'
+        mov si,offset hxBuf
+        mov cx,16
+@@al:   lodsb
+        cmp al,20h
+        jb @@ad
+        cmp al,7Eh
+        jbe @@ap
+@@ad:   mov al,'.'
+@@ap:   stosw
+        if USE386
+        dec cx
+        jnz @@al
+        else
+        loop @@al
+        endif
+        jmp @@next
+@@blank:
+        ; past EOF: clear this row's content cells to spaces
+        mov ax,bp
+        shl ax,5
+        mov di,ax
+        shl ax,2
+        add di,ax
+        add di,160+2
+        mov ax,A_CONT or ' '
+        mov cx,LINEWID
+        rep stosw
+@@next: inc bp
+        cmp bp,LINES_VIS
+        jb @@row
+        ret
+HexDraw endp
+
+;------------------------------------------------------------------------------
+; HexB - paint AL as two hex digits at ES:DI (AH = attribute). fix 187:
+; this was HexDraw's LOCAL "@@hexb" subroutine, but a "proc uses" body
+; gets EVERY "ret" expanded with the register pops (ASMC/MASM USES
+; semantics) - the local ret became 7 pops + ret and each of the 36
+; calls per row ate 7 words of CALLER stack: HexDraw returned through
+; a garbage address into the PSP, walked the zeros straight into the
+; entry point and RE-RAN Init - Alt+H and every binary file's auto
+; hex view crashed the viewer. As its own proc (no USES) its ret is a
+; plain ret again.
+;------------------------------------------------------------------------------
+HexB proc
+        mov bl,al
+        shr al,4                 ; SMART.INC: native on 386, 4 shifts on 8086
+        add al,'0'
+        cmp al,'9'
+        jbe @@h1
+        add al,7
+@@h1:   stosw
+        mov al,bl
+        and al,0Fh
+        add al,'0'
+        cmp al,'9'
+        jbe @@h2
+        add al,7
+@@h2:   stosw
+        ret
+HexB endp
+
+
 ;------------------------------------------------------------------------------
 ; Data - inside the code segment so "-bin"/COM output is self-contained.
 ; zStart..zEnd is cleared by Init with a single REP STOSB.
@@ -4588,6 +6219,20 @@ popRow          dw 0
 popCol          dw 0
 popLines        dw 0
 popOff          dw 0            ; pop-up corner offset, reused 3x (fix 33)
+; --- 2.00 new state (fix 182: the wrap/line-number/word-count plans
+; and their 13 dead slots are gone - nothing ever read them) ---
+hexMode         db 0
+binFile         db 0
+wrapOn          db 0                    ; 2.02: word wrap toggle ('W')
+bmLine          dw 0
+bmHPos          dw 0
+bmValid         db 0
+srPat           db 32 dup(0)
+srLen           dw 0
+srBack          db 0
+srCase          db 0
+srValid         db 0
+fileSize        dd 0
 zEnd            label byte
 isFile          db 0            ; set by ParseCmd: NEVER zeroed by Init
 wDest           dw offset lBuf ; RdLine store target (63): pointer,
@@ -4610,6 +6255,7 @@ endif
 sLoad           db "Loading ",0
 sDots           db "...",0
 sLn             db "Line ",0
+sOff            db "Off ",0            ; 2.02: hex mode status prefix
 sKey            db "   ",24,25,27,26," PgUp PgDn F1=Help F10=About ESC",0
 sErr            db "Cannot open file.",13,10,'$'
 if USE386
@@ -4622,32 +6268,28 @@ a1              db "4VIEW386 ",'0'+VERMAJ,".",'0'+VMIN/10,'0'+VMIN mod 10," - te
 else
 a1              db "4VIEW ",'0'+VERMAJ,".",'0'+VMIN/10,'0'+VMIN mod 10," - text viewer for DOS",0
 endif
-a2              db "Copyright (c) 2025-2026",0
-a3              db "Javier Gutierrez Chamorro (Guti)",0
-a4              db 0
-a5              db "Keys:",0
-a6              db "  Up/Down .. one line up/down",0
-a7              db "  PgUp/PgDn  one page up/down",0
-a8              db "  Left/Right horizontal scroll",0
-a9              db "  Home ..... go to top of file",0
-a10             db "  End ...... go to end of file",0
-a11             db "  F1 ....... show this help",0
-a12             db "  F10 ...... show about box",0
-a13             db "  ESC ...... exit 4VIEW",0
-a14             db 0
-a15             db "Mouse: click scrollbar, wheel or",0
-a16             db "  right button scrolls the view",0
-a17             db 0
+a2              db "Copyright (c) 2025-2026 Javier G. Chamorro",0
+a3              db 0
+a4              db "Navigation:",0
+a5              db " Up/Dn PgUp/Dn Left/Right scroll",0
+a6              db " Home/End top/bottom of file",0
+a7              db 0
+a8              db "Search (LIST-style):",0
+a9              db " F find   S scan   A F3 again",0
+a10             db " ` ^ back-find  ' v back-scan   F9",0
+a11             db " G goto line N",0
+a12             db 0
+a13             db "View:",0
+a14             db " Alt+H hex view of the file",0
+a15             db " I info   Ctrl+P print",0
+a16             db " W toggle word wrap",0
+a17             db "Ctrl+Y mark  Alt+Y recall",0
 if USE386
-a18             db "Usage: 4VIEW386 [file]",0
+a18             db "F1 help  F10 about  ESC exit  4VIEW386",0
 else
-a18             db "Usage: 4VIEW [file]",0
+a18             db "F1 help  F10 about  ESC exit  4VIEW",0
 endif
-if USE386
-a19             db "       TYPE file | 4VIEW386",0
-else
-a19             db "       TYPE file | 4VIEW",0
-endif
+a19             db "Mouse: wheel/click scrolls the view",0
 ; about lines: drawn inside the F10 window (fix 29). @Date/@Time are
 ; stamped by ASMC at assembly time; the quotes are added around their
 ; expansion so the parser accepts the date slashes and time colons.
@@ -4671,7 +6313,39 @@ endif
 b6              db "Assembler: ASMC ",'0'+AV/100,".",'0'+(AV mod 100)/10,'0'+AV mod 10,0
 b7              db "Free to use, modify and distribute.",0
 idleCnt         db 0                    ; idle-pass counter (fix 81); it
-                                        ; only feeds the mod-8 throttle
+; --- 2.00 new data ---
+askMax          dw 0
+askBuf          dw 0
+askCnt          dw 0
+srSave          dd 0
+prnSave         dd 0
+prnH            dw 0
+svDate          dw 0            ; ShowInfo: file date (INT 21h 5700h)
+svTime          dw 0            ; ShowInfo: file time
+nfTab           dw nf1,nf2,sBlank
+errTab          dw err1,err2,sBlank
+sBlank          db 0
+sSize           db "Size: ",0
+sBytes          db " bytes",0
+sPRN            db "PRN",0
+sFF             db 0Ch
+nf1             db "*** Text not found ***",0
+nf2             db 0
+err1            db "Print error",0
+err2            db 0
+sAskFind        db "Find:",0
+sAskScan        db "Scan:",0
+sAskGoto        db "Go to line:",0
+sAskFindB       db "Find back:",0
+sAskScanB       db "Scan back:",0
+; --- 2.02: info popup strings ---
+sIFile          db "File: ",0
+sILines         db "Lines: ",0
+sIPos           db "Position: line ",0
+sIDate          db "Date: ",0
+sIHex           db "Mode: Hex view",0
+sIText          db "Mode: Text view",0
+infoTab         dw offset infoBuf, offset infoBuf+80, offset infoBuf+160, offset infoBuf+240, offset infoBuf+320, offset infoBuf+400, offset infoBuf+480
 ; --- fix 115 (over fix 97): the bulk tail is no longer DECLARED
 ; data. The ten work buffers are pure offset EQUates into the RAM DOS
 ; gives a COM beyond its image - exactly the byte offsets the 1.14
@@ -4685,7 +6359,7 @@ idleCnt         db 0                    ; idle-pass counter (fix 81); it
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW35>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW202>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; the cut
                                         ; step retired by fix 115)
 BSSBASE         equ $                  ; RAM base: first byte past the image
@@ -4704,5 +6378,8 @@ vCache          equ popSave+HLP_H*WWIN*2       ; RSLOTS*SLOTSZ (63/85):
                                         ; zeroed by Init (fix 97)
 vPos            equ vCache+RSLOTS*SLOTSZ       ; VPOSN*4 (64)
 tBuf            equ vPos+VPOSN*4               ; 128 bytes (30)
-BMEMTOP         equ tBuf+128           ; last RAM byte the program owns
-end
+hxBuf           equ tBuf+128           ; 512 bytes (2.02b: was 16, overflowed
+                                        ; by DetectBinary's 512-byte probe)
+infoBuf         equ hxBuf+512           ; 560 bytes: 7 lines * 80 (2.02c info popup)
+BMEMTOP         equ infoBuf+560        ; last RAM byte the program owns
+end
