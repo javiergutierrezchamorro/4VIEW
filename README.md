@@ -1,11 +1,10 @@
-# 4View 1.10
+# 4VIEW and 4VIEW386
 
 **Turbo Vision style text file viewer for DOS**
 
 Copyright (c) 2025-2026 Javier Gutiérrez Chamorro (Guti)
 
-<img width="720" height="400" alt="image" src="https://github.com/user-attachments/assets/d8fa4162-b0cb-49f8-9d23-08b6b9995a40" />
-
+<img width="720" height="400" alt="image" src="https://github.com/user-attachments/assets/f7a8cf25-4ab6-48ee-9038-3d60d318400d" />
 
 ---
 
