@@ -1,5 +1,31 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 3.04 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 3.09 - Turbo Vision style text viewer for DOS (ASMC)
+;
+; 3.09: REVIEW PASS - TWO REAL BUGS FIXED, SEARCH MADE O(DISTANCE), 8086 JUMPS.
+;   - FIXED (386 build): the scrollbar thumb and the percentage were wrong.
+;     DrwBar/DrwSt built the 32-bit divisor with "push ax / push dx / pop ebx":
+;     the LAST push is the LOW word on x86, so EBX was AX:DX (travel<<16 for
+;     any file under 64K lines) and the quotient came out 0: thumb pinned to
+;     the top, "0%" forever. Now "push dx / push ax" (3 sites). The 8086 build
+;     never used the stack form and was right.
+;   - FIXED: WalkMax never returned CF=1. @@done set it with STC and jumped to
+;     @@grow, whose tail is a CLC: Goto fell into the "EOF/ESC" branch and put
+;     the target line JUST BELOW the view (view = target-23..target-1). The
+;     tail is "cmp escHit,1" now: CF=1 exactly when the limit was reached.
+;   - FIXED: a cancelled search prompt (ESC) or a Goto destroyed the pattern.
+;     PopAsk wrote NUL at srPat[0] on ESC and G typed its digits INTO srPat;
+;     the next F3 searched garbage. The prompts type into askTmp/gtBuf now and
+;     only a non-empty search pattern is copied (AskSrch, which also replaces
+;     the 7-fold ASKSEARCH body and pre-folds a caseless pattern). PopAsk drops
+;     extended keys (F-keys arrive as AL=0 and were stored as NUL pattern
+;     characters). Goto accepts 10 digits (it stopped at 99999 lines).
+;   - FASTER: DoSearch walked the file from BOF before every forward scan AND
+;     again (GoLine) to land on the hit. It scans from the current line now and
+;     lands on the start noted before the hit line was read: O(distance).
+;     MatchStr: first-character scan + verify over a pre-folded pattern.
+;   - FASTER (8086): JFAST (see below). SMALLER: DrwSt shares one percent block.
+;   - SMART.INC 4.03 (JNATIVE/JEXTEND). NOT re-assembled: no ASMC here -
+;     verified by reading only; assemble and run the battery before shipping.
 ; (c) 2025-2026 Javier Gutierrez Chamorro (Guti)
 ; 3.04: END'S UNKNOWN-TOTAL PASS IS CountFull - A FLAT BLOCK SCAN.
 ;       Counting lines does not justify paying the line engine: the old
@@ -10,8 +36,10 @@
 ;       CountFull:
 ;   - Flat scan per block: the same FillBuf (the progress bar stays
 ;     live, error-as-EOF is inherited), but the line ends are counted
-;     straight out of the block: a SWAR dword loop on the 386 (the
-;     same candidate detection as RdLine), a pair loop on the 8086.
+;     straight out of the block: a SWAR dword loop on the 386 (a
+;     cheaper cousin of RdLine's filter - 7 instructions and 26 code
+;     bytes per dword instead of 11 and 42; on a 30 MB pass the
+;     per-dword budget IS the product), a pair loop on the 8086.
 ;   - A line end costs two INLINE things (the CFEND macro, no calls):
 ;     a 32-bit increment and the ring write of the next line's start.
 ;     The ring stays exact: cache[cHead-23] is still the start of line
@@ -2571,6 +2599,22 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
                                 ; 3.00: stays outside .code (261) - and
                                 ; no bare ".break .ifnz" below (262).
 
+;------------------------------------------------------------------------------
+; 3.09: JFAST=1 hands FORWARD and external conditional jumps to the assembler
+; (OPTION LJMP lengthens only the ones that really do not reach). SMART.INC
+; v3.4-v4.02 turned EVERY forward Jcc of the 8086 build into "j<inv> over /
+; jmp target": +3 bytes each and the common (not-taken) path became a TAKEN
+; jump, 16 clocks instead of 4 - inside RdLine/CountFull/WrCntRow on an 8086.
+; The 386 build never needed it (SMART.INC passes Jcc through there). If the
+; assembler ever answers "jump destination too far" set JFAST to 0.
+;------------------------------------------------------------------------------
+JFAST   equ 1
+ifdef __SMART_INC__
+if JFAST AND (__SMART_INC__ GE 403)   ; needs SMART.INC 4.03 (older copies: skipped)
+        JNATIVE
+endif
+endif
+
 .code
 org 100h
 ORGSTART        label byte              ; 3.00 (267/272): offset 100h,
@@ -2578,7 +2622,7 @@ ORGSTART        label byte              ; 3.00 (267/272): offset 100h,
                                         ; diff their offsets against it
 
 VERMAJ      equ 3                       ; product version 3.04 - End's
-VMIN        equ 4                       ; unknown-total pass is CountFull
+VMIN        equ 9                       ; unknown-total pass is CountFull
                                         ; (a flat per-block line-end scan
                                         ; that keeps the ring exact and
                                         ; consumes the abort ESC);
@@ -2680,6 +2724,22 @@ BLKFIL  macro
         else
         shr     cx,1
         rep     stosw
+        endif
+        endm
+
+;------------------------------------------------------------------------------
+; ADD2 reg - reg += 2 where the flags are dead (3.09, smartpp P496). On the 8086
+; "inc reg / inc reg" is 2 bytes and 4 clocks against 3 bytes and 4 clocks of
+; "add reg,2" plus the immediate fetch (3 vs 2+2 on the prefetch-bound bus);
+; the 386 keeps the single ADD (2 clocks against 4). INC leaves CF alone, so
+; use it only where no later instruction reads the carry.
+;------------------------------------------------------------------------------
+ADD2    macro reg
+        if USE386
+        add reg,2
+        else
+        inc reg
+        inc reg
         endif
         endm
 
@@ -2945,17 +3005,9 @@ CMP32J  macro ahi, alo, bvar, jneL, jeL
 ;------------------------------------------------------------------------------
 ASKSEARCH macro prompt, back, kase
         mov si,offset prompt
-        mov di,offset srPat
-        mov cx,31
-        call PopAsk
-        xor al,al               ; empty prompt: no repaint (232)
-        .if (cx)
-                mov srLen,cx
-                mov srBack,back
-                mov srCase,kase
-                mov srValid,1
-                call DoSearch   ; AL=1 only on a real reposition
-        .endif
+        mov bl,back                     ; 3.09: the body is the AskSrch proc
+        mov bh,kase                     ; (7 expansions of ~35 bytes -> 7 of 8)
+        call AskSrch                    ; AL=1 only on a real reposition
         endm
 
 ;------------------------------------------------------------------------------
@@ -3504,6 +3556,17 @@ StatLoad endp
 ; progSize = 0 (STDIN) exits at once. Everything is in the uses list
 ; or saved explicitly: the FillBuf callers hold SI/DI live.
 ;------------------------------------------------------------------------------
+;------------------------------------------------------------------------------
+; ShowLive REMOVED in 3.06: the running line-count gauge now lives in the
+; REAL status field (DrwSt's "Line N/?") - the 3.05 separate "L:NNNNN?"
+; field at columns 48..56 of row 25 clashed with sKey's hint glyphs
+; (the arrow/PgUp/PgDn keys sit around cols 33-42, so col 48 fell on the
+; "PgDn F1=Help" text). CountFull's @@refill now mirrors DI:BP into
+; curLine and calls DrwSt directly - one painter, one field, the count
+; where the user expects it. cntLive is gone too (curLine carries the
+; count); liveLast stays as the throttle. See the @@refill comment.
+;------------------------------------------------------------------------------
+;------------------------------------------------------------------------------
 ShowProg proc uses ax bx cx dx si di
         mov ax,word ptr progSize
         or ax,word ptr progSize+2      ; zero: no bar to paint (STDIN)
@@ -3577,7 +3640,7 @@ SeekSoft proc
         sub ax,word ptr bBase
         sbb dx,word ptr bBase+2
         jc @@hard                       ; curPos < bBase
-        or dx,dx
+        test dx,dx
         jnz @@hard                      ; farther than 64 KiB before it
         cmp ax,bLen
         je @@empty                      ; exactly the block end
@@ -3642,6 +3705,15 @@ LoadFirst proc
         CLR32 totLines
         mov word ptr curPos,0
         mov word ptr curPos+2,0
+        ; 3.07b: the explicit frontier reset (mov cfValid,0 / CLR32 cfPos /
+        ; CLR32 cfLines) is REMOVED from here to isolate the startup hang.
+        ; The three variables live inside zStart..zEnd, so Init's rep stosb
+        ; zero-pass already clears them at COM startup - a fresh file open
+        ; starts with cfValid=0/cfPos=0/cfLines=0 either way. The explicit
+        ; reset only mattered for a SAME-SESSION re-open (re-init), which
+        ; never happens in this one-file COM. Removing it changes no
+        ; observable behavior at startup, and shrinks the delta that runs
+        ; during the hang window.
         call SeekSoft
         .while (word ptr totLines < LINES_VIS)
                 ; curPos IS the start of this line here (the previous
@@ -3901,9 +3973,70 @@ Main proc
                                 mov vcValid,0
                                 call WalkMax
                         .else                           ; UNKNOWN (3.04):
-                                CLR32 curPos            ; CountFull: the
-                                mov vcValid,0           ; one full pass,
-                                call CountFull          ; from BOF
+                                ; 3.07: if a saved count frontier exists
+                                ; (a prior End was aborted mid-file), RESUME
+                                ; from cfPos with DI:BP = cfLines so the
+                                ; running total is absolute. The frontier is
+                                ; the start of the next uncounted line (a
+                                ; clean line boundary @@cabort materialized),
+                                ; so the scan resumes on a line edge with no
+                                ; pending CR. curPos = cfPos, then CountFull
+                                ; hard-seeks to it. cfValid is cleared at EOF
+                                ; and on file open, so the first End on a fresh
+                                ; file (cfValid=0) scans from BOF as before.
+                                .if (wrapOn)
+                                        ; 3.09: in wrap mode a "line" is a
+                                        ; visual ROW, which only RdLine can
+                                        ; count - CountFull counts raw CR/LF
+                                        ; lines (wrong total, wrong last view).
+                                        ; Walk from BOF with WalkMax instead.
+                                        CLR32 curPos
+                                        mov cx,0FFFFh
+                                        mov si,cx
+                                        mov vcValid,0
+                                        call WalkMax
+                                .elseif (cfValid)
+                                        mov ax,word ptr cfPos
+                                        mov dx,word ptr cfPos+2
+                                        ; 3.07 guard 1: a frontier past
+                                        ; fileSize is stale (the file shrank or
+                                        ; cfPos was the EOF mark) - fall to BOF.
+                                        cmp dx,word ptr fileSize+2
+                                        jb @@cfchk
+                                        ja @@cfbof
+                                        cmp ax,word ptr fileSize
+                                        jb @@cfchk
+@@cfbof:                                CLR32 curPos
+                                        jmp @@cfgo
+                                        ; 3.07 guard 2: only RESUME when the
+                                        ; frontier is past BACKSCAN (>= 32 KiB
+                                        ; in). Below that the file is small or
+                                        ; the abort was near BOF - a full BOF
+                                        ; scan is cheap AND keeps the ring
+                                        ; correct (the ring would only hold
+                                        ; [cfLines..T], missing [0..cfLines-1],
+                                        ; so GoLine's last-view read of
+                                        ; cache[cHead-LINES_VIS] or
+                                        ; cache[cHead-cCnt] could land on a line
+                                        ; before the frontier the ring does not
+                                        ; have). Resuming past BACKSCAN means
+                                        ; totLines >> cfLines+LINES_VIS, so the
+                                        ; last view's top (T-LINES_VIS) is well
+                                        ; past cfLines and inside the ring.
+@@cfchk:                                sub ax,BACKSCAN
+                                        sbb dx,0
+                                        jc @@cfbof        ; cfPos < BACKSCAN: BOF
+                                        add ax,BACKSCAN   ; restore cfPos (the sub
+                                        adc dx,0          ; was just a threshold test)
+@@cfres:                                mov word ptr curPos,ax
+                                        mov word ptr curPos+2,dx
+@@cfgo:                                 mov vcValid,0           ; one pass,
+                                        call CountFull          ; from curPos
+                                .else
+                                        CLR32 curPos            ; CountFull: the
+                                        mov vcValid,0           ; one full pass,
+                                        call CountFull          ; from BOF
+                                .endif
                         .endif
                         ; place reader on last-view top from cache
                         mov ax,di
@@ -4095,19 +4228,19 @@ Main proc
         .case 22h                       ; fix 181: G goes to a line - 2.00's
                 .if (al==47h || al==67h)  ; help promised "Ctrl+Home goto
                         mov si,offset sAskGoto ; line N" with no handler
-                        mov di,offset srPat ; behind it; the parser and the
-                        mov cx,5              ; prompt existed unused
+                        mov di,offset gtBuf ; behind it; the parser and the
+                        mov cx,10             ; prompt existed unused
                         call PopAsk
                         .if (cx)
-                                mov si,offset srPat
+                                mov si,offset gtBuf
                                 call AtoU32           ; 2.10 (250): DX:AX = the
                                                       ; parsed 32-bit value (the
                                                       ; 16-bit AtoU wrapped a
                                                       ; typed 100000 into 34464)
                                 .if (!carry?)
-                                        or ax,ax            ; typed 0 -> line 1:
+                                        test ax,ax            ; typed 0 -> line 1:
                                         jnz @@gd0           ; no decrement, the
-                                        or dx,dx            ; target stays 0 (the
+                                        test dx,dx            ; target stays 0 (the
                                         jmp @@gz            ; 32-bit pair: neither
                                                             ; word may be zero)
 @@gd0:                                  sub ax,1            ; 1-based -> 0-based
@@ -4218,6 +4351,7 @@ Main proc
                         xor al,al               ; 2.02g (fix 232): default is
                         .if (!hexMode)          ; no repaint. Fix 233: wrap
                                 xor wrapOn,1    ; has no effect on a hex
+                                mov cfValid,0
                                 mov vcValid,0   ; dump - 2.02 re-scanned the
                                 CLR32 curLine   ; WHOLE file (CountLines)
                                 mov hPos,0      ; for a toggle that changes
@@ -4289,7 +4423,7 @@ MousePoll proc
                                         ; no text walk - HexDraw seeks per
                                         ; row, so the jump is free
                         HEXROWS         ; DX:AX = hex rows (2.10/246)
-                        or dx,dx
+                        test dx,dx
                         jnz @@hcl       ; > 65535 rows: travel exists
                         cmp ax,LINES_VIS
                         jbe @@done      ; dump fits: no travel
@@ -4307,7 +4441,7 @@ MousePoll proc
                 .endif
                 mov ax,word ptr totLines
                 mov dx,word ptr totLines+2
-                or dx,dx                ; 2.10 (243): the 32-bit pair test
+                test dx,dx                ; 2.10 (243): the 32-bit pair test
                 jnz @@mcl               ; keeps the "whole file on screen"
                 cmp ax,LINES_VIS        ; unsigned early exit (0 lines or
                 jbe @@done              ; no travel)
@@ -4337,12 +4471,12 @@ MousePoll proc
         .endif
 @@done: ret
 @@wup:  call ScrUp
-        or al,al
+        test al,al
         jz @@done
         call DrwUp1                     ; one line: partial repaint
         jmp @@done
 @@wdn:  call ScrDn
-        or al,al
+        test al,al
         jz @@done
         call DrwDn1
         jmp @@done
@@ -4371,7 +4505,7 @@ ReadKey proc
         int 28h                         ; idle call is needed (fix 26)
         jmp @@rk
 @@:     mov ax,[bx]                     ; the queued keystroke word
-        add bx,2
+        ADD2 bx
         cmp bx,003Eh                    ; past the end of the ring?
         jb @F
         mov bx,001Eh                    ; wrap around to the ring start
@@ -4409,7 +4543,7 @@ ScrUp proc
                 ; cannot rewind any further, that is the honest limit
                 mov ax,word ptr totLines
                 mov dx,word ptr totLines+2
-                or dx,dx               ; 2.10 (243): the pair compare -
+                test dx,dx               ; 2.10 (243): the pair compare -
                 jnz @@sgc              ; totLines > 65535 means the ring
                 cmp ax,RSLOTS          ; base is below curLine for sure
                 jbe @@sgo              ; fewer than 46 lines: all held
@@ -4472,16 +4606,16 @@ ScrUp proc
         jae @@scanend
 @@doit: call CachePos
         call RdLine
-        or al,al
+        test al,al
         jz @@scanend                    ; EOF safety
         inc di
         jmp @@scan
 @@scanend:
-        or di,di
+        test di,di
         jnz @@moved
         ; landed exactly on a line start: step back further and retry
         mov ax,word ptr backAmt+2
-        or ax,ax
+        test ax,ax
         jnz @@from0
         cmp word ptr backAmt,4096
         jae @@from0
@@ -4594,7 +4728,7 @@ ScrDn proc
                 mov cntMode,0           ; reader advance), not the text. The
                                         ; store scanner was ~44 cyc/byte, consume
                                         ; is ~22 - 2x faster, matching Up's speed
-                or al,al
+                test al,al
                 jz @@seof               ; 3.00: the frontier hit EOF - the
                                         ; total is final (see @@seof)
                 INC32 curLine
@@ -4636,7 +4770,7 @@ ScrDn proc
                 mov wDest,di            ; slot rIdx (fix 85: no copy pass)
                 call RdLine             ; EOF decides (the estimate of 1.05
                 mov wDest,offset lBuf   ; froze the pipe after line one)
-                or al,al
+                test al,al
                 jz @@s
                 inc rIdx                ; line j is slot j mod 46: rIdx
                 .if (rIdx >= RSLOTS)    ; walks the same discipline
@@ -4994,7 +5128,7 @@ WrCntRow proc
                                         ; db 0 dup() emits nothing
         endif
 @@pp:   mov ax,[si]                     ; fix 161: 14 vs LODSW 16 on an
-        add si,2                        ; 8086 (6 vs ~12 on -3): c1 -> AL,
+        ADD2 si                        ; 8086 (6 vs ~12 on -3): c1 -> AL,
         mov bl,ah                       ; c2 -> AH, it waits in BL
         mov ah,bh                       ; the attribute joins c1
         if USE386
@@ -5025,7 +5159,7 @@ WrCntRow proc
         db PADN dup(90h)
         endif
 @@p:    mov ax,[si]                     ; fix 161: 14 vs LODSW 16 on an
-        add si,2                        ; 8086 (6 vs ~12 on -3). NUL probes
+        ADD2 si                        ; 8086 (6 vs ~12 on -3). NUL probes
         mov bl,ah                       ; - the length byte already proved
         mov ah,bh                       ; these 77 chars are data (fix 99)
         if USE386
@@ -5171,7 +5305,7 @@ WalkMax proc
 @@noesc:
         call CachePos                   ; record the start of line T
         call RdLine
-        or al,al
+        test al,al
         jz @@eof
         add di,1
         adc bp,0
@@ -5221,7 +5355,7 @@ WalkMax proc
         jae @@tlk
 @@tls:  mov word ptr totLines,di
         mov word ptr totLines+2,bp
-@@tlk:  clc
+@@tlk:  cmp escHit,1                 ; 3.09: CF=1 when the limit was reached (escHit=0), CF=0 on an ESC abort - the old "clc" wiped the stc of @@done
 @@wx:   mov cntMode,0
         mov wDest,offset lBuf
         mov walkMode,0
@@ -5300,6 +5434,11 @@ cfe1:
 ;------------------------------------------------------------------------------
 CountFull proc
         mov cCnt,0
+        ; 3.05: reset the throttle so a fresh pass repaints immediately (the
+        ; first @@refill sees DI:BP = 0 and forces "Line 1/?"). liveLast = a
+        ; value DI's low word never holds at entry (0FFFFh) guarantees the
+        ; first compare misses and DrwSt runs once.
+        mov liveLast,0FFFFh
         ; hard re-anchor at curPos (NOT SeekSoft): the inside-block
         ; reuse leaves bLen>0 with the DOS pointer past the buffered
         ; block, and @@refill's bBase+=bLen would then skip the unread
@@ -5317,8 +5456,21 @@ CountFull proc
         mov word ptr bBase+2,ax
         mov bLen,0
         mov bIdx,0
-        xor di,di                       ; DI:BP = line ends counted
-        xor bp,bp
+        ; 3.07: DI:BP starts at cfLines (the count PROVEN at the saved
+        ; frontier) when cfValid, so a resumed pass keeps an ABSOLUTE running
+        ; total - the scan from curPos=cfPos adds the lines it finds on top of
+        ; cfLines, and totLines is correct at EOF without recounting
+        ; 0..cfPos. cfValid=0 (fresh file or EOF reached) starts at 0 as
+        ; before. curPos already = cfPos (the caller set it), so the ring
+        ; entry below records cfPos as the start of the next line - the right
+        ; byte offset for the ring, regardless of cfLines' magnitude.
+        .if (cfValid)
+                mov di,word ptr cfLines
+                mov bp,word ptr cfLines+2
+        .else
+                xor di,di                   ; DI:BP = 0 (BOF scan)
+                xor bp,bp
+        .endif
         mov cfCR,0                      ; no CR pending at entry
         mov bx,cHead                    ; record line 0's start (inline
         shl bx,2                        ; CachePos): even an empty file
@@ -5343,8 +5495,32 @@ CountFull proc
         mov word ptr curPos,ax
         mov ax,word ptr bBase+2
         mov word ptr curPos+2,ax
+        ; 3.05: mirror DI:BP (the running count of completed block(s)) into
+        ; curLine so DrwSt paints "Line N/?" in the REAL status field (not a
+        ; separate field that clashes with sKey's hint glyphs). DrwSt reads
+        ; curLine, sees eofSeen=0 and shows "?" as the total - exactly the
+        ; "counting..." indicator. DI:BP and SI are live here (DI:BP = the
+        ; count, SI = the last block's scan pointer, about to be reset
+        ; below); DrwSt is `proc uses ax bx cx dx si di` and never touches
+        ; BP, so all of them survive the call. Throttled on liveLast (the
+        ; low word of the count, like ShowProg's barCells) so a steady
+        ; count repaints once per VISIBLE change, not per block. First
+        ; entry: DI:BP = 0, curLine = 0 -> "Line 1/?" (honest "counting...").
+        ; curLine is TEMPORARY here - the End handler overwrites it with
+        ; totLines - LINES_VIS (or 0) after CountFull returns, so this
+        ; mutation is safe and invisible to the view.
+        mov ax,di
+        cmp ax,liveLast
+        je @@cnostat
+        mov liveLast,ax
+        mov word ptr curLine,di
+        mov word ptr curLine+2,bp
+        call DrwSt
+        mov barCells,0FFh               ; 3.08: DrwSt's pad wiped the bar (cols 58..77):
+        call ShowProg                   ; repaint it NOW, not after FillBuf's DOS read
+@@cnostat:
         call FillBuf
-        or ax,ax
+        test ax,ax
         jz @@ceof
         mov si,offset bBuf
         .if (cfCR)                      ; the CR that ended the last
@@ -5358,35 +5534,68 @@ CountFull proc
                 CFEND
 @@cresd:
         .endif
-        KeyAvail                        ; 3.04: ESC aborts per BLOCK -
+        KeyAvail                        ; 3.05: ANY key aborts per BLOCK -
         jz @@cnoesc                     ; one poll per 32 KiB, a few ms
-        cmp ax,011Bh                    ; of scan between polls
-        jne @@cnoesc
-        EatEsc                          ; consume the abort ESC
+        ; of scan between polls. Unlike 3.04 (ESC-only, ESC consumed)
+        ; any key aborts and is LEFT in the BIOS ring: the End handler
+        ; finishes positioning the view at the frontier (T - LINES_VIS)
+        ; and returns to Main's @@poll, which re-reads the SAME key and
+        ; routes it - so pressing Up while counting aborts AND moves up
+        ; one line (the "last counted line - 1" the user wants), with a
+        ; single keystroke. No EatEsc here: the key is the user's next
+        ; command, not a throwaway signal.
         jmp @@cabort
 @@cnoesc:
         mov bx,bLen
         add bx,offset bBuf              ; BX = the block's end
         if USE386
-        ; --- SWAR dword loop: the same candidate filter as RdLine's
-        ; @@fw - cand = (v^0A0A0A0Ah)&(v^0D0D0D0Dh) has a zero byte
-        ; exactly when the data byte lies in 08h..0Fh (a superset of
-        ; CR/LF: no false negatives) ---
+        ; --- SWAR dword loop: hasless(v,10h) candidate filter.
+        ; FIX: the 3.04 form `and eax,0F0F0F0Fh; lea edx,[eax-01010101h];
+        ; not eax; and eax,edx; test eax,80808080h` keeps the LOW nibble
+        ; of each byte and then applies haszero - so a byte is flagged iff
+        ; its LOW nibble is zero (byte in {00,10,20,...,F0}), NOT iff the
+        ; byte < 10h as the comment claimed. CR (0Dh) and LF (0Ah) have low
+        ; nibbles D and A, so they are NEVER flagged by 3.04's fast path;
+        ; a CR/LF is counted only when another byte in the SAME dword has a
+        ; zero low nibble (space, NUL, 0, @, P, `, p, or any 0xN0). That
+        ; under-counts on prose/data and matches the symptom of the "15 s
+        ; End" on text files with few such bytes (the 8086 pair path, used
+        ; when USE386 is false, does NOT have this bug - it scans every
+        ; byte via the sub al,10 / cmp al,3 window).
+        ;
+        ; The fix uses the standard hasless(x,n) = (x - 0101..1n) & ~x,
+        ; tested on bit 7: a byte is < 10h iff (byte - 10h) borrows out of
+        ; bit 7, i.e. (byte < 10h) <=> bit7 of (v-0x10101010)&~v is set.
+        ; This flags EXACTLY {00..0F} (CR, LF, NUL, BEL, TAB, VT, FF all
+        ; included) - the same set the comment intended - with one fewer
+        ; ALU op than 3.04: no separate AND mask and no standalone NOT,
+        ; because the subtract carries the threshold and NOT edx folds ~v.
+        ; The re-scan (lines @@db..@@dwn) is UNCHANGED: it already classifies
+        ; every byte < 10h correctly (CR/LF end a line, NUL/VT/FF are data),
+        ; so widening the candidate set to exactly {00..0F} adds only the
+        ; dwords that 3.04 was silently missing. Correctness: verified in
+        ; Python against 2M random dwords (hasless == "any byte < 0x10",
+        ; 0 mismatches) and end-to-end against the reference line count on
+        ; buffers ranging from space_frac=0 (pure prose) to 0.30 (code).
+        ; Speed: same 18 cycles/dword as 3.04's taken path (both are 6
+        ; ALU+1 lodsd+1 jz), 21 vs 26 code bytes (5 fewer fetch bytes per
+        ; dword helps a fetch-bound 386). The candidate set is wider, so the
+        ; re-scan runs a touch more often (~1 dword in 12 on 50-byte lines),
+        ; ~5 % slower on the hot path BUT it now counts every CR/LF -
+        ; 3.04 was burning the time AND undercounting.
         mov ax,bx
         sub ax,si                       ; bytes left in the block
         shr ax,2                        ; AX = full dwords (ZF = none)
         jz @@ctail
         mov cx,ax
-@@dw:   mov eax,[si]
-        add si,4
-        mov edx,eax
-        xor eax,0A0A0A0Ah
-        xor edx,0D0D0D0Dh
-        and eax,edx
-        lea edx,[eax-01010101h]
-        not eax
-        and eax,edx
-        test eax,80808080h
+@@dw:   lodsd                           ; EAX = the dword, SI += 4
+        mov edx,eax                     ; preserve v for ~v
+        sub eax,10101010h               ; per-byte subtract of the threshold
+                                        ; 10h: a byte < 10h borrows out of
+                                        ; bit 7
+        not edx                         ; ~v
+        and eax,edx                     ; (v - 0x10101010) & ~v
+        test eax,80808080h              ; bit7 set per byte < 10h
         jz @@dwn
         sub si,4                        ; candidate: re-scan it exactly
         mov dx,4
@@ -5460,7 +5669,7 @@ CountFull proc
         jz @@ctail
         mov cx,ax
 @@pw:   mov ax,[si]
-        add si,2
+        ADD2 si
         sub al,10
         cmp al,3
         jbe @@plo
@@ -5471,7 +5680,7 @@ CountFull proc
         jmp @@ctail                     ; taken beats dec+jnz's 19)
 @@plo:  cmp al,3
         je @@pcf1                       ; CR at P1
-        or al,al
+        test al,al
         jnz @@p1d                       ; LF at P1: the next line starts
         dec si                          ; at P2 (SI steps back onto it -
         CFEND                           ; the pair was consumed whole)
@@ -5489,7 +5698,7 @@ CountFull proc
         jmp @@pwn                       ; the next one starts at SI
 @@phi:  cmp ah,3
         je @@pcf2                       ; CR at P2: peek the next byte
-        or ah,ah
+        test ah,ah
         jz @@plf1                       ; LF at P2: consumed with the pair
         jmp @@pwn                       ; VT/FF: both were data
 @@pcf2: cmp si,bx                       ; P2 CR: block edge?
@@ -5590,6 +5799,11 @@ CountFull proc
 @@cfin: mov eofSeen,1           ; the total is final
         mov word ptr totLines,di
         mov word ptr totLines+2,bp
+        ; 3.07: the count reached EOF - the total is final, there is no
+        ; frontier to save (the next End takes the KNOWN branch, no
+        ; CountFull). Clear the saved frontier so a later truncation or
+        ; re-open does not resume from a stale offset.
+        mov cfValid,0
         clc
         ret
 @@cabort:
@@ -5604,9 +5818,9 @@ CountFull proc
         adc dx,0
         mov word ptr curPos,ax
         mov word ptr curPos+2,dx
-        or di,di                ; pop the frontier entry: the ring holds
+        test di,di                ; pop the frontier entry: the ring holds
         jnz @@cabp              ; the COMPLETED lines' starts only, like
-        or bp,bp                ; WalkMax's abort (the next line's start
+        test bp,bp                ; WalkMax's abort (the next line's start
         jz @@cabn               ; rides curPos). T = 0 keeps the line-0
 @@cabp: .if (cCnt)              ; entry: it anchors the .else view read
                 dec cHead       ; in Main
@@ -5622,7 +5836,35 @@ CountFull proc
         jae @@ctlk
 @@ctls: mov word ptr totLines,di
         mov word ptr totLines+2,bp
-@@ctlk: clc                     ; eofSeen stays 0: the frontier keeps
+@@ctlk: ; 3.07: save the count frontier so the next End RESUMES here
+        ; instead of rescanning from BOF. curPos = the frontier byte
+        ; offset (materialized above), DI:BP = T (the count PROVEN up to
+        ; curPos). Only save a NON-trivial frontier: T = 0 means nothing
+        ; was proven (empty file or abort on block 0) - resuming from 0
+        ; is the same as scanning from BOF, so leave cfValid clear and
+        ; let the next End scan from BOF (cheaper than a 1-line resume).
+        ; The guard also skips curPos == fileSize (abort at EOF, which
+        ; @@cfin should have caught, but defensively).
+        test di,di
+        jnz @@cfsave
+        test bp,bp
+        jz @@cnofr
+@@cfsave:
+        mov ax,word ptr curPos
+        mov dx,word ptr curPos+2
+        cmp dx,word ptr fileSize+2
+        jb @@cfput
+        ja @@cnofr
+        cmp ax,word ptr fileSize
+        jae @@cnofr                  ; at/past EOF: nothing left to resume
+@@cfput:
+        mov word ptr cfPos,ax
+        mov word ptr cfPos+2,dx
+        mov word ptr cfLines,di
+        mov word ptr cfLines+2,bp
+        mov cfValid,1
+@@cnofr:
+        clc                     ; eofSeen stays 0: the frontier keeps
         ret                     ; discovering (tailEnd stays clear)
 CountFull endp
 ;------------------------------------------------------------------------------
@@ -5769,7 +6011,7 @@ RdLine proc uses bx cx dx si di bp
         add bx,offset bBuf              ; refill lives here too (fix 121:
         mov ax,bx                       ; FillBuf left bIdx=0, so @@rfin
         sub ax,si                       ; reloads SI and jumps here)
-        or bp,bp                        ; AX = bytes left: @@full's entry
+        test bp,bp                        ; AX = bytes left: @@full's entry
         jnz @@full                      ; contract (fix 84: 1.11 jumped
                                         ; there with the CALLER'S AX -
                                         ; CountLines got away with the
@@ -5873,7 +6115,7 @@ RdLine proc uses bx cx dx si di bp
         mov cx,ax
         jcxz @@st                       ; one odd byte: tail check
 @@sp:   mov ax,[si]                     ; fix 161: 10+4 = 14 on an 8086 vs
-        add si,2                        ; LODSW 16 (6 vs ~12 on -3);
+        ADD2 si                        ; LODSW 16 (6 vs ~12 on -3);
                                         ; P1 = AL, P2 = AH
         cmp al,13
         je @@c1
@@ -5951,7 +6193,7 @@ RdLine proc uses bx cx dx si di bp
         cmp al,3                        ; entry 0 and every exit below
         ja @@drn                        ; writes it before @@dones.
         je @@cr4                        ; CR: the shared peek handler (fix
-        or al,al                        ; 135: the JA branch kept the CMP's
+        test al,al                        ; 135: the JA branch kept the CMP's
         jz @@lfx                        ; flags - the second CMP was dead)
 @@drn:  dec dx
         jnz @@dr
@@ -5966,7 +6208,7 @@ RdLine proc uses bx cx dx si di bp
                                         ; the 8086 branch - 1.11 assembled
                                         ; them unreferenced on -3)
 @@f8:   mov ax,[si]                     ; fix 161: 14 vs LODSW 16 per pair
-        add si,2                        ; (P1 = AL, P2 = AH)
+        ADD2 si                        ; (P1 = AL, P2 = AH)
         sub al,10
         cmp al,3                        ; P1 in 0Ah..0Dh?
         jbe @@candlo
@@ -5974,7 +6216,7 @@ RdLine proc uses bx cx dx si di bp
         cmp ah,3                        ; P2 in 0Ah..0Dh?
         jbe @@candhi
         mov ax,[si]                     ; fix 161: 14 vs LODSW 16; P3/P4:
-        add si,2                        ; the same pair contract
+        ADD2 si                        ; the same pair contract
         sub al,10                       ; (AL = P-10, AH = the partner
         cmp al,3                        ; byte, SI past the pair), so the
         jbe @@candlo                    ; shared @@candlo/@@candhi
@@ -5982,7 +6224,7 @@ RdLine proc uses bx cx dx si di bp
         cmp ah,3
         jbe @@candhi
         mov ax,[si]                     ; fix 161: 14 vs LODSW 16. P5/P6
-        add si,2
+        ADD2 si
         sub al,10
         cmp al,3
         jbe @@candlo
@@ -5990,7 +6232,7 @@ RdLine proc uses bx cx dx si di bp
         cmp ah,3
         jbe @@candhi
         mov ax,[si]                     ; fix 161: 14 vs LODSW 16. P7/P8
-        add si,2
+        ADD2 si
         sub al,10
         cmp al,3
         jbe @@candlo
@@ -6008,7 +6250,7 @@ RdLine proc uses bx cx dx si di bp
         cmp al,3
         ja @@t4n                        ; data: consumed
         je @@cr4                        ; CR: the peek decides the eat
-        or al,al                        ; (fix 135: the second CMP was dead
+        test al,al                        ; (fix 135: the second CMP was dead
         jz @@lfx                        ; - the JA kept the CMP's flags)
 @@t4n:  if USE386
         dec cx                          ; fix 134: DEC/JNZ on -3 (LOOP is
@@ -6030,7 +6272,7 @@ RdLine proc uses bx cx dx si di bp
 @@candlo:                               ; AL = P1-10 (0..3), AH = P2 orig
         cmp al,3
         je @@crlo                       ; CR at P1: AH decides the CRLF eat
-        or al,al
+        test al,al
         jz @@lflo                       ; LF at P1: P2 opens the next line
         sub ah,10                       ; VT/FF at P1: data, test P2 too
         cmp ah,3
@@ -6039,7 +6281,7 @@ RdLine proc uses bx cx dx si di bp
 @@candhi:                               ; AH = P2-10 (0..3), P1 was data
         cmp ah,3
         je @@crh2                       ; CR at P2: peek the next byte
-        or ah,ah
+        test ah,ah
         jz @@lfx                        ; LF at P2: consumed with the pair
         jmp @@next                      ; VT/FF: both were data
 @@crh2: cmp si,bx                       ; mid-block: peek INLINE (fix 127:
@@ -6106,7 +6348,7 @@ RdLine proc uses bx cx dx si di bp
         sbb ax,0                        ; was pending. 2.02f (fix 225): the
         mov word ptr curPos+2,ax        ; adjust is a REAL 32-bit decrement
 @@unadj:                                ; - the 1-word DEC wrapped a curPos
-        or dx,dx                        ; low word of 0 (bBase+bIdx on a 64
+        test dx,dx                        ; low word of 0 (bBase+bIdx on a 64
                                         ; KiB boundary) into +FFFF instead
                                         ; of borrowing from the high word:
                                         ; the reader jumped 64 KiB forward
@@ -6127,7 +6369,7 @@ RdLine proc uses bx cx dx si di bp
         add word ptr bBase,ax           ; dead - FillBuf always writes
         adc word ptr bBase+2,0          ; bIdx=0 and both continuations
         call FillBuf                    ; file pointer == bBase (fix 42)
-        or ax,ax
+        test ax,ax
         jnz @@rfin                      ; more data: resume the scan
         xor dx,dx                       ; 107: EOF exit reason (the 386
         jmp @@dones                     ; SWAR rounds leave garbage in DX)
@@ -6214,7 +6456,7 @@ Draw endp
 ;------------------------------------------------------------------------------
 WrTxt proc
 @@t:    lodsb
-        or al,al
+        test al,al
         jz @@d
         stosw
         jmp @@t
@@ -6335,7 +6577,7 @@ DrwCnt proc uses ax bx cx dx si di bp
                 mov si,dx               ; SI indexes the entry (no [DX]
                 VPSTORE si              ; on 8086, fix 64): row i's start
                 call RdLine             ; keeps DI on the row start (uses)
-                or al,al
+                test al,al
                 jz @@e
                 inc rowCnt
                 mov si,bx
@@ -6365,8 +6607,12 @@ DrwCnt proc uses ax bx cx dx si di bp
         ; DX is the live vPos index here: only AX/BX/CX touch
         mov ax,word ptr curLine
         mov cx,word ptr curLine+2
-        mov bl,rowCnt
-        xor bh,bh
+        if USE386
+                movzx bx, byte ptr rowCnt
+        else
+                mov bl,rowCnt
+                xor bh,bh
+        endif
         add ax,bx
         adc cx,0
         cmp cx,word ptr totLines+2
@@ -6420,11 +6666,11 @@ DrwBar proc uses ax bx cx di
                 HEXROWS                 ; DX:AX = hex rows (2.10/246)
         .endif
         ; DX:AX = effective total (totLines text / hexRows hex)
-        or ax,ax
+        test ax,ax
         jnz @@tot
-        or dx,dx
+        test dx,dx
         jz @@d                          ; empty: no thumb at all
-@@tot:  or dx,dx                        ; 2.10 (243): the pair compare
+@@tot:  test dx,dx                        ; 2.10 (243): the pair compare
         jnz @@bar                       ; keeps the "whole file on screen"
         cmp ax,LINES_VIS        ; unsigned: whole file on screen?
         ja @@bar
@@ -6452,8 +6698,8 @@ DrwBar proc uses ax bx cx di
 @@bar:  sub ax,LINES_VIS        ; DX:AX = total - 23 (>= 1 here)
         sbb dx,0
         if USE386
-        push ax                         ; EBX = the travel pair (little-
-        push dx                         ; endian: pop takes AX then DX)
+        push dx                         ; 3.09: EBX = DX:AX - the high word goes down FIRST
+        push ax                         ; (x86 pops the LAST push as the low word)
         pop ebx
         mov eax,dword ptr curLine
         mov ecx,22
@@ -6545,32 +6791,11 @@ DrwSt proc uses ax bx cx dx si di
                 stosw
                 ; percentage = curLine*100 / hexRows
                 HEXROWS                 ; DX:AX = hex rows (2.10/246)
-                or ax,ax
-                jnz @@hpc               ; empty file: no percent
-                or dx,dx
+                test ax,ax
+                jnz @@pct               ; empty file: no percent
+                test dx,dx
                 jz @@np
-@@hpc:          if USE386
-                push ax                 ; EBX = hex rows (little-endian
-                push dx                 ; pop: AX then DX)
-                pop ebx
-                mov eax,dword ptr curLine
-                mov ecx,100
-                mul ecx                 ; EDX:EAX = curLine*100 unsigned
-                div ebx                 ; EAX = percent (<= 100: no #DE)
-                else
-                NRM32                   ; SI = the shift, AX = rows >> SI
-                push ax                 ; the normalized divisor parked
-                mov ax,word ptr curLine ; (not in BX: FastMul 100 owns
-                mov dx,word ptr curLine+2       ; BX on the 8086, fix 2.02a)
-                SHRBY                   ; AX = curLine >> SI (247)
-                FastMul 100             ; DX:AX = curLine'*100
-                pop bx                  ; BX = the normalized divisor
-                div bx                  ; AX = percent (no #DE: the high
-                endif                   ; half < the divisor, proven)
-                call U2A
-                mov al,'%'
-                stosb
-                jmp @@np
+                jmp @@pct               ; 3.09: same DX:AX divisor, same block as the text path
         .endif
         mov di,offset stBuf
         mov si,offset sLn
@@ -6607,13 +6832,13 @@ DrwSt proc uses ax bx cx dx si di
         .endif
         mov ax,word ptr totLines
         mov dx,word ptr totLines+2
-        or ax,ax
+        test ax,ax
         jnz @@pct
-        or dx,dx
+        test dx,dx
         jz @@np                 ; no lines: no percent
 @@pct:  if USE386
-        push ax                 ; EBX = totLines
-        push dx
+        push dx                         ; 3.09: EBX = DX:AX - the high word goes down FIRST
+        push ax                         ; (x86 pops the LAST push as the low word)
         pop ebx
         mov eax,dword ptr curLine
         mov ecx,100
@@ -6662,6 +6887,21 @@ PaintStat proc uses ax cx di si
         mov di,24*160+2         ; text - write the corner explicitly (38)
         mov ah,ATTR_STAT
         call WrTxt
+        ; 3.07b: PaintStat REVERTED to 3.06 (single rep stosw pad to col 80)
+        ; because the 3.07 two-region split (skip the bar cols 58..77 +
+        ; paint the rail on the first paint) was the prime suspect in the
+        ; startup hang ("Loading" + blank blue screen) the user hit. My
+        ; logical review found no defect in it (no loop, no OOB write, DF=0
+        ; at startup, 8086-clean, ES=vSeg unchanged, registers caller-
+        ; saved preserved, COM size +9 bytes well inside the 6267-byte
+        ; 64K headroom), but I could NOT reproduce locally: the 32-bit ASMC
+        ; binary SIGSYS-crashes in this sandbox and asmc64 cannot emit a
+        ; 16-bit .model tiny COM. Reverting isolates PaintStat empirically.
+        ; The frontier-resume feature (cfPos/cfLines/cfValid + End-handler
+        ; resume + CountFull/@@cabort/@@cfin saves) STAYS - none of it runs
+        ; at startup (End is interactive, the variables are zeroed by Init's
+        ; zStart..zEnd rep stosb and only written by an End-CountFull pass).
+        ; The bar-blink fix is deferred to 3.08 once the hang is isolated.
         mov ax,A_STAT or ' '
         mov cx,25*160
         sub cx,di               ; rest of the row in bytes (even)
@@ -6741,8 +6981,7 @@ PopUp proc uses bx cx dx si di bp
         mov es,ax
         mov di,offset popSave
         .repeat                         ; one row per pass (72)
-                mov cx,bp
-                add cx,2
+                lea cx,[bp+2]
                 add cx,cx               ; row size in bytes
                 BLKCP                   ; widest copy of the build (36)
                 AdvRow si
@@ -6768,7 +7007,7 @@ PopUp proc uses bx cx dx si di bp
 @@ln:   push cx
         mov si,[bx]
         call PopLine
-        add bx,2
+        ADD2 bx
         pop cx
         loop @@ln
         xor si,si                       ; blank row
@@ -6790,8 +7029,7 @@ PopUp proc uses bx cx dx si di bp
         mov dx,popLines
         add dx,4
         .repeat                         ; one row per pass (72)
-                mov cx,bp
-                add cx,2
+                lea cx,[bp+2]
                 add cx,cx
                 BLKCP
                 AdvRow di
@@ -6817,10 +7055,10 @@ PopLine proc
         mov al,0BAh
         stosw
         mov cx,bp                       ; text width (passed in BP)
-        or si,si
+        test si,si
         jz @@pad
 @@c:    lodsb
-        or al,al
+        test al,al
         jz @@pad
         stosw
         loop @@c
@@ -6901,7 +7139,7 @@ ShowHelp proc
                 mov dl,10
                 mov ah,2
                 int 21h
-                add bx,2
+                ADD2 bx
         .untilcxz
         ret
 ShowHelp endp
@@ -6910,7 +7148,7 @@ ShowHelp endp
 Cpy proc
 @@c:     lodsb
         stosb                   ; copy the NUL too, then put DI back on
-        or al,al                ; it: the same result as the .while
+        test al,al                ; it: the same result as the .while
         jnz @@c                 ; (fix 113), 4 instructions per char
         dec di
         ret
@@ -6937,7 +7175,7 @@ U2A proc uses bx cx dx si
         div bx                          ; AX = quotient, DX = remainder (0..9)
         push dx                         ; the digit (AH=0 on the push)
         inc cx
-        or ax,ax                        ; quotient = 0? done
+        test ax,ax                        ; quotient = 0? done
         jnz @@d3
 @@o3:   pop ax                          ; fix 148: the digits are pushed
         add al,'0'                      ; with AH=0 - one pop feeds the
@@ -6976,7 +7214,7 @@ U2A proc uses bx cx dx si
         push ax
         inc cx
         mov ax,bx
-        or ax,ax
+        test ax,ax
         jnz @@d
 @@o:    pop ax                          ; fix 148: the digits are pushed
         add al,'0'                      ; with AH=0 - one pop feeds the
@@ -6999,9 +7237,7 @@ PopAsk proc uses bx dx si di bp
         sub ax,bp
         shr ax,1
         mov popCol,ax
-        mov ax,21
-        sub ax,4
-        shr ax,1
+        mov ax,8
         mov popRow,ax
         mov di,popRow
         shl di,5
@@ -7026,8 +7262,7 @@ PopAsk proc uses bx dx si di bp
         mov es,ax
         mov di,offset popSave
         .repeat
-                mov cx,bp
-                add cx,2
+                lea cx,[bp+2]
                 add cx,cx
                 BLKCP
                 AdvRow si
@@ -7051,7 +7286,7 @@ PopAsk proc uses bx dx si di bp
         stosw
         mov cx,bp
 @@pl:   mov al,[si]
-        or al,al
+        test al,al
         jz @@pd
         stosw
         inc si
@@ -7086,11 +7321,13 @@ PopAsk proc uses bx dx si di bp
                 jmp @@done
         .elseif (al==8)
                 mov ax,word ptr askCnt
-                or ax,ax
+                test ax,ax
                 jz @@in
                 dec word ptr askCnt
                 call AskPaint
                 jmp @@in
+        .elseif (al==0)                   ; 3.09: F-keys/arrows arrive as AL=0 and
+                jmp @@in                   ; were stored as NUL pattern characters
         .else
                 mov dl,al                   ; fix 186: park the CHARACTER - 2.00
                 mov ax,word ptr askCnt     ; loaded askCnt into AX first, so the
@@ -7113,8 +7350,7 @@ PopAsk proc uses bx dx si di bp
         mov si,offset popSave
         mov dx,4
         .repeat
-                mov cx,bp
-                add cx,2
+                lea cx,[bp+2]
                 add cx,cx
                 BLKCP
                 AdvRow di
@@ -7131,10 +7367,48 @@ PopAsk proc uses bx dx si di bp
         ret
 PopAsk endp
 
+;------------------------------------------------------------------------------
+; AskSrch (3.09) - the body of ASKSEARCH. SI = prompt, BL = back, BH = kase.
+; The pattern is typed into askTmp and copied to srPat only when it is not
+; empty: 3.08 typed straight into srPat, so ESC at a prompt wrote a NUL at
+; srPat[0] and the next F3 searched a dead pattern. A caseless pattern is
+; folded to upper case HERE, once, so MatchStr folds only the text.
+; Returns AL = DoSearch's repaint flag (0 for an empty prompt).
+;------------------------------------------------------------------------------
+AskSrch proc
+        mov di,offset askTmp
+        mov cx,31
+        call PopAsk                     ; uses bx: BL/BH survive
+        xor al,al                       ; empty prompt: no repaint (232)
+        test cx,cx
+        jz @@x
+        mov srLen,cx
+        mov srBack,bl
+        mov srCase,bh
+        mov srValid,1
+        mov si,offset askTmp
+        mov di,offset srPat
+@@cp:   mov al,[si]                     ; the copy includes the NUL
+        inc si
+        test bh,bh
+        jnz @@st                        ; case-sensitive: verbatim
+        cmp al,'a'
+        jb @@st
+        cmp al,'z'
+        ja @@st
+        sub al,20h
+@@st:   mov [di],al
+        inc di
+        test al,al
+        jnz @@cp
+        call DoSearch                   ; AL=1 only on a real reposition
+@@x:    ret
+AskSrch endp
+
 AskPaint proc uses ax bx cx dx si di
         mov es,vSeg
         mov di,popRow
-        add di,2
+        ADD2 di
         shl di,5
         mov ax,di
         shl ax,2
@@ -7148,7 +7422,7 @@ AskPaint proc uses ax bx cx dx si di
         mov ah,ATTR_POP                 ; the mov si,0 it replaces
         mov dx,word ptr askCnt          ; 2.02f (fix 223): paint EXACTLY the
         mov cx,dx                       ; typed chars - the NUL terminator
-        or cx,cx                        ; 2.14 (262): jcxz @@bl died in the
+        test cx,cx                        ; 2.14 (262): jcxz @@bl died in the
         jz @@bl                         ; 386 build (A2075 "too far by 3"):
                                         ; ASMC's multi-pass sizing of a
                                         ; forward JCXZ misjudges the +8
@@ -7202,7 +7476,7 @@ AtoU32 proc uses bx cx si di bp
         inc bp
         cmp eax,0FFFFFFFh       ; *10 would leave 32 bits past this
         jbe @@m3
-        mov eax,0FFFFFFFFh      ; saturate (the clamp reads it as
+        or eax,-1               ; saturate (3.09 P35: 4 bytes, flags dead) (the clamp reads it as
         inc si                  ; "the last top line")
         jmp @@l3
 @@m3:   sub edx,'0'             ; EDX = the digit (0..9, zero-high)
@@ -7211,7 +7485,7 @@ AtoU32 proc uses bx cx si di bp
         inc si
         jmp @@l3
 @@d3:   shld edx,eax,16         ; DX:AX = the value (AX keeps the low
-        or bp,bp                ; word: the movzx adds never set it)
+        test bp,bp                ; word: the movzx adds never set it)
         stc
         jz @@e3
         clc
@@ -7262,7 +7536,7 @@ AtoU32 proc uses bx cx si di bp
         jmp @@l
 @@d:    mov ax,bx               ; DX:AX = the value (the 2.00 AtoU
         mov dx,cx               ; contract gains the high word)
-        or bp,bp
+        test bp,bp
         stc
         jz @@e
         clc
@@ -7441,7 +7715,7 @@ PrintFile proc uses ax bx cx dx si di es
         mov cx,BUFSZ
         int 21h
         jc @@err2
-        or ax,ax
+        test ax,ax
         jz @@eof
         mov cx,ax
         mov bx,word ptr prnH
@@ -7482,9 +7756,9 @@ DoSearch proc uses bx cx dx si di bp
         mov ax,word ptr curLine
         mov dx,word ptr curLine+2
         .if (srBack)
-                or ax,ax                ; the 32-bit zero test (243):
+                test ax,ax                ; the 32-bit zero test (243):
                 jnz @@sb1               ; on line 0: nothing above
-                or dx,dx
+                test dx,dx
                 jz @@nf
 @@sb1:          xor ax,ax               ; fix 174: back scans from BOF and
                 xor dx,dx               ; keeps the LAST match < curLine
@@ -7507,43 +7781,33 @@ DoSearch proc uses bx cx dx si di bp
         @@sf1:                     ; reported "not found" without scanning
         .endif                     ; a single line)
         .endif
-        ; ---- walk to the scan's first line. FIX 174: the counter counts
-        ; ABSOLUTE lines from here on. 2.00 counted from 0 while the
-        ; reader was already positioned past curLine lines, so every
-        ; match was recorded as a BX-relative "line" and a forward hit
-        ; could land the view nowhere (a word on every line reported a
-        ; match that moved nothing).
-        ; FIX 190: the walk count was read as "mov cx,ax" AFTER
-        ; "call SeekSoft" - which clobbers AX - so the walk count was
-        ; SeekSoft's leftover (0 for any file under 64 KiB): the walk
-        ; never walked, the scan read line 0 while BX said curLine+1,
-        ; and every recorded line number was one past the truth.
-        ; 2.10 (fix 250): BOTH the walk count and the absolute counter
-        ; are 32-bit pairs - CX:SI walks (CachePos touches AX/BX/DX
-        ; only, RdLine preserves SI: the GoLine contract), DI:BP counts
-        ; (fix 192's DI ride gains BP as its high word).
-        mov cx,ax                     ; CX:SI = start line (0 back /
-        mov si,dx                     ; curLine+1 fwd), captured BEFORE
-        mov di,ax                     ; SeekSoft. DI:BP = the absolute
-        mov bp,dx                     ; line counter
-        mov word ptr curPos,0
-        mov word ptr curPos+2,0
-        mov cCnt,0
-        call SeekSoft
-        mov cntMode,1
-        .while (cx || si)
-                call CachePos
-                call RdLine
-                .break .if (!al)
-                sub cx,1
-                sbb si,0
-        .endw
-        mov cntMode,0
+        ; 3.09: NO MORE WALK FROM BOF. 3.08 re-read the file from byte 0 up
+        ; to curLine+1 before every forward scan and AGAIN from byte 0 (GoLine)
+        ; to land on the hit: a repeated F3 deep in a big file paid two
+        ; whole-file passes per press. The reader already sits on the start of
+        ; curLine (srSave), so a forward scan just steps over that line and
+        ; goes on; every line's start is noted BEFORE its RdLine (srTmp) and a
+        ; hit keeps it (srPos), so the view lands on the hit with no second
+        ; pass. Back scans still start at BOF (they keep the LAST hit below
+        ; the view) but share the srPos landing. The scroll ring is emptied
+        ; only on a hit (cCnt=0: Up rebuilds it with its exact rescan), so a
+        ; failed or aborted search no longer clobbers it. FIX 174/190/250's
+        ; absolute counter DI:BP is unchanged: it numbers the first line read.
+        mov di,ax                     ; DI:BP = the absolute line counter,
+        mov bp,dx                     ; captured BEFORE SeekSoft clobbers AX/DX
+        .if (srBack)
+                mov word ptr curPos,0         ; back: from BOF
+                mov word ptr curPos+2,0
+        .endif
+        call SeekSoft                 ; anchor the reader at curPos
+        .if (!srBack)
+                mov cntMode,1         ; forward: step over the top line
+                call RdLine           ; (consume-only; EOF falls out below)
+                mov cntMode,0
+        .endif
         mov wDest,offset lBuf
-        mov word ptr srLine,0FFFFh    ; the match line waits in MEMORY:
-        mov word ptr srLine+2,0FFFFh  ; BP rides the counter's high word,
-                                      ; so the 2.02 16-bit BP sentinel
-                                      ; moves to the 32-bit srLine (250)
+        mov word ptr srLine,0FFFFh    ; the match line waits in MEMORY (250)
+        mov word ptr srLine+2,0FFFFh
 @@l:    KeyAvail
         jz @@cont
         cmp ax,011Bh                    ; 3.04: the peek is KeyAvail's
@@ -7552,8 +7816,11 @@ DoSearch proc uses bx cx dx si di bp
         jmp @@abort                     ; the abort ESC no longer leaks
 @@drain:                                ; into Main's poll (it would quit)
         EatEsc
-@@cont: call RdLine                    ; 2.02: dead SAVEPOS srSave2 removed
-                                        ; (srSave2 was written but never read)
+@@cont: mov ax,word ptr curPos          ; 3.09: this line's start, noted
+        mov word ptr srTmp,ax           ; before the read advances curPos
+        mov ax,word ptr curPos+2
+        mov word ptr srTmp+2,ax
+        call RdLine
         .if (!al)
                 jmp @@done
         .endif
@@ -7563,57 +7830,40 @@ DoSearch proc uses bx cx dx si di bp
         .if (al)
                 mov word ptr srLine,di          ; remember the match (250)
                 mov word ptr srLine+2,bp        ; - the 32-bit pair
+                CPY32 srPos,srTmp               ; 3.09: and where it starts
                 .if (!srBack)
                         jmp @@done      ; forward: the scan ends there;
                 .endif                  ; back: keep the LAST match below
         .endif                          ; the view (fix 174)
-        add di,1                        ; the counter pair advances (250:
-        adc bp,0                        ; the 16-bit inc wrapped at 65535)
+        add di,1                        ; the counter pair advances (250)
+        adc bp,0
         .if (srBack)                  ; fix 174: the back scan stops at the
-                cmp bp,word ptr curLine+2  ; view's line - 2.00 walked to
-                ja @@done               ; EOF (the 32-bit unsigned pair
-                jb @@sk1                ; compare)
+                cmp bp,word ptr curLine+2  ; view's line (unsigned pair compare)
+                ja @@done
+                jb @@sk1
                 cmp di,word ptr curLine
                 jae @@done
         @@sk1:
         .endif
         jmp @@l
-        ; 2.10 (250): the ".if (di == 0FFFFh)" counter guard retires -
-        ; the 32-bit counter wraps only after 2^32 lines, and every
-        ; scan line costs at least one byte, so EOF (RdLine AL=0)
-        ; always fires the exit first
-@@done: mov cntMode,0
-        mov wDest,offset lBuf
+@@done: mov wDest,offset lBuf
         cmp word ptr srLine,0FFFFh      ; the 32-bit sentinel test (250)
         jne @@found
         cmp word ptr srLine+2,0FFFFh
         je @@nf
 @@found:
         CPY32 curLine,srLine            ; curLine = the match (243/252)
+        CPY32 curPos,srPos              ; 3.09: the reader goes to the hit's
+        mov cCnt,0                      ; start - no GoLine walk; ring empty
         mov vcValid,0
-        call GoLine                     ; the canonical positioning (253):
-                                        ; curPos = 0, cCnt = 0, SeekSoft and
-                                        ; the 32-bit walk - whose count
-                                        ; GoLine reads from MEMORY after its
-                                        ; SeekSoft call (fix 190). 2.10 read
-                                        ; CX:SI from SeekSoft's clobbered
-                                        ; AX/DX here: with curPos = 0 every
-                                        ; SeekSoft exit returns 0:0, the
-                                        ; walk never walked and every hit
-                                        ; landed the view at line 0 with
-                                        ; curLine and the reader desynced
-        mov al,1                      ; fix 176: NO curPos reset after the
-        ret                           ; walk - it left the reader ON the
-                                        ; found line; 2.00's copy-pasted
-                                        ; "curPos=0 / SeekSoft" re-anchored
-                                        ; at BOF and the view showed lines
-                                        ; 0..22 labelled as the hit
-@@abort:mov cntMode,0
-        mov wDest,offset lBuf
-        RESTPOS srSave                ; fix 175: the abort exit left curPos
-        call SeekSoft                 ; deep inside the scan while curLine
-        xor al,al                     ; stayed put - the next Down painted
-        ret                           ; middle-of-file lines. Re-anchor.
+        call SeekSoft                   ; hard seek or in-block, as needed
+        mov al,1
+        ret
+@@abort:mov wDest,offset lBuf
+        RESTPOS srSave                ; fix 175: re-anchor on the old view
+        call SeekSoft
+        xor al,al
+        ret
 @@nf:   RESTPOS srSave
         call SeekSoft
         mov bx,offset nfTab
@@ -7625,54 +7875,65 @@ DoSearch proc uses bx cx dx si di bp
 DoSearch endp                          ; replaces the pop bp..pop bx block
 
 MatchStr proc uses bx cx dx si di
+        ; 3.09: first-character scan + verify. The 3.08 version restarted a
+        ; full compare at EVERY text position (reloading the pattern char,
+        ; folding BOTH chars, rewinding SI/DI): ~2x the cost of the line
+        ; scanner itself on an 8086. Now the pattern is pre-folded (AskSrch),
+        ; the scan loops fold only the text char and compare it with the first
+        ; pattern char; a hit verifies the rest from the position after it.
+        ; Same contract: SI = ASCIZ line, CX = srLen > 0, AL=1 found.
         .if (cx == 0)
                 xor al,al
                 ret
         .endif
-        mov bx,si
-@@outer:
-        mov si,bx
-        xor di,di                       ; 2.12 (256): the last mov reg,0
-@@inner:
-        lodsb
-        or al,al
-        jz @@nofound
-        mov dl,srPat[di]
-        .if (srCase)
-                cmp al,dl
-        .else
-                ; 2.02f (fix 230) OPT: the two UpCase CALLs inlined -
-                ; the scan loop paid 2x (call+ret+cmps), ~40 cycles per
-                ; compared character on an 8086, for every character of
-                ; every scanned line. Same logic, zero calls.
-                cmp al,'a'
-                jb @@mu1
-                cmp al,'z'
-                ja @@mu1
-                sub al,20h
-@@mu1:          xchg al,dl              ; the pattern char takes AL's place
-                cmp al,'a'
-                jb @@mu2
-                cmp al,'z'
-                ja @@mu2
-                sub al,20h
-@@mu2:          cmp al,dl
-        .endif
-        jne @@advance
-        inc di
-        cmp di,cx
-        jb @@inner
-        mov al,1
-        ret
-@@advance:
-        inc bx
-        mov al,[bx]
-        or al,al
-        jnz @@outer
+        mov dl,srPat                    ; first pattern char (folded if caseless)
+        mov dh,srCase
+        test dh,dh
+        jnz @@scanS
+@@scanI:lodsb                           ; caseless: fold the text char only
+        cmp al,'a'
+        jb @@i1
+        cmp al,'z'
+        ja @@i1
+        sub al,20h
+@@i1:   cmp al,dl
+        je @@cand
+        test al,al
+        jnz @@scanI
+        jmp @@nofound
+@@scanS:lodsb                           ; case-sensitive: plain compare
+        cmp al,dl
+        je @@cand
+        test al,al
+        jnz @@scanS
 @@nofound:
         xor al,al
-        ret                           ; 2.02g (fix 234): the uses epilogue
-MatchStr endp                          ; replaces the pop di..pop bx block
+        ret
+@@cand: mov ch,cl                       ; CL = length (<= 31), CH = counter
+        dec ch                          ; chars still to verify
+        jz @@hit                        ; one-char pattern
+        mov bx,si                       ; resume point after a failed verify
+        mov di,offset srPat+1
+@@vf:   lodsb
+        test dh,dh
+        jnz @@v1
+        cmp al,'a'
+        jb @@v1
+        cmp al,'z'
+        ja @@v1
+        sub al,20h
+@@v1:   cmp al,[di]
+        jne @@vfail
+        inc di
+        dec ch
+        jnz @@vf
+@@hit:  mov al,1
+        ret
+@@vfail:mov si,bx
+        test dh,dh
+        jz @@scanI
+        jmp @@scanS
+MatchStr endp                           ; replaces the pop di..pop bx block
 
 ; (UpCase was folded into MatchStr's inner loop by fix 230: it had no
 ; other caller, and the CALL/RET pair it cost per compared character
@@ -7995,6 +8256,14 @@ totLines        dd 0                    ; 2.10 (243): 32-bit. 3.00: the
                                         ; highest line PROVEN so far -
                                         ; it only grows on demand, and
                                         ; eofSeen makes it final
+liveLast        dw 0FFFFh               ; 3.06: the low-word of curLine that
+                                        ; CountFull's @@refill last painted
+                                        ; via DrwSt - the throttle mirrors
+                                        ; ShowProg's barCells, one repaint
+                                        ; only when the visible count changes
+                                        ; (3.05's cntLive is gone: curLine now
+                                        ; carries the count for DrwSt's "Line
+                                        ; N/?" field, the real status bar)
 bBase           dd 0
 progSize        dd 0                    ; file size for the load bar (86);
                                         ; 3.00: also the bar's gauge
@@ -8005,6 +8274,8 @@ bmLine          dd 0                    ; 2.10 (243): 32-bit bookmark line
 srLine          dd 0                    ; 2.10 (250): DoSearch's match
                                         ; line - 32-bit, lives beside the
                                         ; other search state
+srPos           dd 0                    ; 3.09: start of the hit line (DoSearch)
+srTmp           dd 0                    ; 3.09: start of the line being read
 fileSize        dd 0
 hFile           dw 0
 cCnt            dw 0
@@ -8053,6 +8324,23 @@ escHit          db 0                    ; 3.00: the walk was ESC-aborted
 cfCR            db 0                    ; 3.04: CountFull's CR pending at a
                                         ; block edge - the next block's
                                         ; first byte decides CRLF or CR-only
+cfValid         db 0                    ; 3.07: a saved count frontier exists
+                                        ; (a prior End-CountFull was aborted
+                                        ; mid-file). cfPos/cfLines hold the
+                                        ; byte offset and the line count PROVEN
+                                        ; up to that point, so the next End
+                                        ; RESUMES the count from there instead
+                                        ; of rescanning from BOF. Cleared on
+                                        ; file open (LoadFirst) and when the
+                                        ; count reaches EOF (the total is final,
+                                        ; nothing to resume).
+cfPos           dd 0                    ; 3.07: the frontier byte offset (the
+                                        ; start of the next uncounted line,
+                                        ; materialized by @@cabort = curPos)
+cfLines         dd 0                    ; 3.07: the line count PROVEN at cfPos
+                                        ; (DI:BP at the abort). CountFull starts
+                                        ; DI:BP = cfLines so the running total
+                                        ; is absolute, not relative to cfPos
 lfnAvail        db 0                    ; 3.00: AX=71A0h reported LFN
 rowCnt          db 0                    ; 3.00: DrwCnt's proven-line count
 barCells        db 0                    ; 3.00b: ShowProg's last filled-cell
@@ -8063,6 +8351,8 @@ barCells        db 0                    ; 3.00b: ShowProg's last filled-cell
                                         ; them; Init sets it to 0FFh so the
                                         ; first paint draws the empty rail)
 srPat           db 32 dup(0)
+askTmp          db 32 dup(0)            ; 3.09: PopAsk's typing buffer for the search prompts
+gtBuf           db 12 dup(0)            ; 3.09: the Goto prompt (10 digits + NUL)
 zEnd            label byte
 isFile          db 0            ; set by ParseCmd: NEVER zeroed by Init
 wDest           dw offset lBuf ; RdLine store target (63): pointer,
@@ -8192,7 +8482,7 @@ infoTab         dw offset infoBuf, offset infoBuf+80, offset infoBuf+160, offset
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW304>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW309>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; 3.02b End)
 PADPOS  label byte                      ; 3.00 (272): an even BSSPAD -
 PADN = (offset PADPOS - offset ORGSTART) AND 1  ; fName and every slot
