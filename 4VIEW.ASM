@@ -2727,6 +2727,18 @@ BLKFIL  macro
         endif
         endm
 
+; AH2AX - AX = AH zero-extended (3.09, P29): MOVZX on the 386, MOV + XOR on
+; the 8086. (Today only U2A's 8086 branch uses it; the macro keeps the choice in
+; one place and the preprocessor rule out of the unreachable text.)
+AH2AX   macro
+        if USE386
+        movzx ax,ah
+        else
+        mov al,ah
+        xor ah,ah
+        endif
+        endm
+
 ;------------------------------------------------------------------------------
 ; ADD2 reg - reg += 2 where the flags are dead (3.09, smartpp P496). On the 8086
 ; "inc reg / inc reg" is 2 bytes and 4 clocks against 3 bytes and 4 clocks of
@@ -4265,6 +4277,12 @@ Main proc
                                                             ; (an ESC lands the
                                                             ; view on the frontier
                                                             ; the walk reached)
+                                        jnc @@gcf                  ; 3.09: limit reached, but line T exists only if
+                                        mov ax,word ptr curPos     ; the reader is still BEFORE the end of the file
+                                        mov dx,word ptr curPos+2   ; (a Goto to lines+1 left a blank view): CF =
+                                        sub ax,word ptr fileSize   ; curPos < fileSize; otherwise the last-view
+                                        sbb dx,word ptr fileSize+2 ; branch below runs
+@@gcf:
                                         .if (carry?)        ; limit reached: the
                                                 mov word ptr curLine,si    ; reader is already
                                                 mov word ptr curLine+2,cx  ; on the target
@@ -5133,10 +5151,10 @@ WrCntRow proc
         mov ah,bh                       ; the attribute joins c1
         if USE386
         mov es:[di],ax                  ; fix 160: 5+2 vs STOSW ~11/cell
-        add di,2
+        ADD2 di
         mov al,bl
         mov es:[di],ax
-        add di,2                        ; cell 2 (AH still ATTR_CONT)
+        ADD2 di                        ; cell 2 (AH still ATTR_CONT)
         dec cx                          ; fix 134: DEC/JNZ on -3 - LOOP is
         jnz @@pp                        ; 11 cycles taken on a 386, the
         else                            ; pair is 9 (and worse on 486+)
@@ -5164,10 +5182,10 @@ WrCntRow proc
         mov ah,bh                       ; these 77 chars are data (fix 99)
         if USE386
         mov es:[di],ax                  ; fix 160: 5+2 vs STOSW ~11/cell
-        add di,2
+        ADD2 di
         mov al,bl
         mov es:[di],ax
-        add di,2
+        ADD2 di
         dec cx                          ; fix 134: DEC/JNZ on -3 (LOOP is
         jnz @@p                         ; 11 cycles taken on a 386)
         else
@@ -7194,8 +7212,7 @@ U2A proc uses bx cx dx si
         shr ax,4
         add si,ax
         mov ax,si
-        mov al,ah                       ; AX = SI>>8 without 8 shifts
-        xor ah,ah
+        AH2AX                           ; AX = SI>>8 without 8 shifts
         add si,ax
         shr si,3                        ; approximate quotient
         mov ax,si
