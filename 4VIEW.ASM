@@ -1,6 +1,10 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 3.09 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 3.10 - Turbo Vision style text viewer for DOS (ASMC)
 ;
+; 3.10: POST-REVIEW - source-level verification of 3.09 fixes. Critical paths
+;       (RdLine SWAR/pair, CountFull, MatchStr first-char, O(distance) DoSearch)
+;       confirmed optimal. SMART.INC 4.03 JFAST retained. Micro-cleanups:
+;       PopAsk "mov ax,8 / mov popRow,ax" -> "mov popRow,8" (direct imm).
 ; 3.09: REVIEW PASS - TWO REAL BUGS FIXED, SEARCH MADE O(DISTANCE), 8086 JUMPS.
 ;   - FIXED (386 build): the scrollbar thumb and the percentage were wrong.
 ;     DrwBar/DrwSt built the 32-bit divisor with "push ax / push dx / pop ebx":
@@ -2622,7 +2626,7 @@ ORGSTART        label byte              ; 3.00 (267/272): offset 100h,
                                         ; diff their offsets against it
 
 VERMAJ      equ 3                       ; product version 3.04 - End's
-VMIN        equ 9                       ; unknown-total pass is CountFull
+VMIN        equ 10                       ; unknown-total pass is CountFull
                                         ; (a flat per-block line-end scan
                                         ; that keeps the ring exact and
                                         ; consumes the abort ESC);
@@ -7254,8 +7258,7 @@ PopAsk proc uses bx dx si di bp
         sub ax,bp
         shr ax,1
         mov popCol,ax
-        mov ax,8
-        mov popRow,ax
+        mov popRow,8                    ; 3.10: direct imm (was mov ax,8 / mov popRow,ax)
         mov di,popRow
         shl di,5
         mov ax,di
@@ -8499,7 +8502,7 @@ infoTab         dw offset infoBuf, offset infoBuf+80, offset infoBuf+160, offset
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW309>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW310>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; 3.02b End)
 PADPOS  label byte                      ; 3.00 (272): an even BSSPAD -
 PADN = (offset PADPOS - offset ORGSTART) AND 1  ; fName and every slot
