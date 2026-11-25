@@ -213,9 +213,12 @@
 ;       dword ptr on 386: 3 each); every 32-bit load/store rides new
 ;       GET32/SET32 and the five manual mem-to-mem copies ride CPY32
 ;       (byte-identical on 8086, CPY32's mov eax on 386); a dead
-;       test dx,dx before an unconditional jmp is gone. Net: about
-;       77 image bytes on 8086 (32 more on 386) and 109 source
-;       lines. NOTE - the ".if is SIGNED"
+;       test dx,dx before an unconditional jmp is gone; the PopUp/
+;       PopAsk save/restore/geometry/border blocks are the SaveBox/
+;       RestBox/PopCorner/BoxTop/BoxBot macros (identical bytes; the
+;       fix-173 park rides an IFNB parameter). Net: about 77 image
+;       bytes on 8086 (32 more on 386) and 112 source lines. NOTE -
+;       the ".if is SIGNED"
 ;       rule of 93/129/140/149/208 is obsolete for ASMC 2.22+ (hll.asm
 ;       emits unsigned branches unless .IFS or MT_SIGNED): the
 ;       hand-coded cmp/jb sites stay (correct and portable), only this
@@ -2873,6 +2876,106 @@ GET32 macro var,lo,hi
 SET32 macro var,lo,hi
         mov word ptr var,lo
         mov word ptr var+2,hi
+        endm
+
+; PopCorner - DI = popRow*160 + popCol*2, parked in popOff: the byte
+; offset of a pop-up window's top-left corner (the fix-13 shift
+; breakdown; the nine lines stood at PopUp and PopAsk - 3.10
+; audit, fix 276 pass 4: one expansion, identical bytes).
+PopCorner macro
+        mov di,popRow
+        shl di,5                        ; *32
+        mov ax,di
+        shl ax,2                        ; *128
+        add di,ax                       ; *160
+        mov ax,popCol
+        shl ax,1
+        add di,ax
+        mov popOff,di
+        endm
+
+; SaveBox [park] - save the region under a pop-up window into
+; popSave: DX = rows, BP = the text width; SI becomes the video row
+; cursor, DI the popSave cursor. popOff is read BEFORE DS switches
+; to video - reading it after fetched the variable from the VIDEO
+; page (the 1.04 regression), and AdvRow must not touch memory for
+; the same reason. Park (PopAsk's fix 173): a register to push/pop
+; around the loop - SI would eat it, and 2.00 painted the prompt
+; row from CODE BYTES (garbage) once the loop was done.
+SaveBox macro park
+        mov si,popOff                   ; read BEFORE the DS switch
+        push es, ds                     ; SMART.INC multi push
+        ifnb <park>
+        push park                       ; the parked register rides the
+        endif                           ; loop (fix 173)
+        mov ax,vSeg
+        mov ds,ax
+        mov ax,ss                       ; data segment (COM: SS==DS)
+        mov es,ax
+        mov di,offset popSave
+        .repeat                         ; one row per pass (72)
+                lea cx,[bp+2]
+                add cx,cx               ; row size in bytes
+                BLKCP                   ; widest copy of the build (36)
+                AdvRow si
+                dec dx
+        .untilz
+        ifnb <park>
+        pop park                        ; the parked register back
+        endif
+        pop ds
+        endm
+
+; RestBox cnt[,inc] - restore a pop-up's saved region from
+; popSave back to video (BP = width; DS = data, ES = video after
+; the macro): the exact inverse of SaveBox. DX = the row count,
+; set HERE - the originals set it between SI and the loop, and
+; the position matters to nothing but the eye (1.04's lesson does
+; not apply: DS is data until ES goes video). inc: the "+4" of
+; PopUp's popLines+4 rides as its own ADD, byte-identical to the
+; two original lines.
+RestBox macro cnt,inc
+        mov ax,vSeg
+        mov es,ax
+        mov di,popOff
+        mov si,offset popSave
+        mov dx,cnt
+        ifnb <inc>
+        add dx,inc
+        endif
+        .repeat                         ; one row per pass (72)
+                lea cx,[bp+2]
+                add cx,cx               ; row size in bytes
+                BLKCP                   ; widest copy of the build (36)
+                AdvRow di
+                dec dx
+        .untilz
+        endm
+
+; BoxTop / BoxBot - a pop-up window's top (C9-CD...-BB) and bottom
+; (C8-CD...-BC) borders; BP = the inner width, DI = the video
+; cursor. BoxTop advances DI to the next row; BoxBot leaves it (the
+; restore follows). AH carries ATTR_POP through the draw (fix 33)
+; - PopAsk re-arms it per row before the border macros.
+BoxTop macro
+        mov ax,A_POP or 0C9h
+        stosw
+        mov al,0CDh
+        mov cx,bp
+        rep stosw
+        mov al,0BBh
+        stosw
+        AdvRow di
+        endm
+
+BoxBot macro
+        mov al,0C8h
+        stosw
+        mov al,0CDh
+        mov cx,bp
+        rep stosw
+        mov al,0BCh
+        stosw
         endm
 
 ; INC32 var / DEC32 var - 32-bit increment / decrement. Flags dead at
@@ -6910,56 +7013,20 @@ PopUp proc uses bx cx dx si di bp
         sub ax,cx
         shr ax,1                        ; (25-(lines+4))/2
         mov popRow,ax
-        ; DI = popRow*160 + popCol*2: byte offset of the window corner
-        mov di,popRow
-        shl di,5                        ; *32
-        mov ax,di
-        shl ax,2                        ; *128
-        add di,ax                       ; *160
-        mov ax,popCol
-        shl ax,1
-        add di,ax
-        mov popOff,di
+        PopCorner
         .if (mPres)
                 mov ax,2
                 int 33h                 ; hide the mouse over the window
         .endif
-        ; save the region under the window (DS=video, ES=data). BP
-        ; carries the width and DX the row count; everything read from
-        ; the data segment is loaded BEFORE DS is switched to video -
-        ; popOff included (1.04 regression: reading it after the switch
-        ; fetched the variable from the VIDEO page), and AdvRow must not
-        ; touch memory for the same reason.
         mov dx,popLines
         add dx,4                        ; rows = lines + 4
-        mov si,popOff
-        push es, ds                     ; SMART.INC multi push
-        mov ax,vSeg
-        mov ds,ax
-        mov ax,ss                       ; data segment (COM: SS==DS)
-        mov es,ax
-        mov di,offset popSave
-        .repeat                         ; one row per pass (72)
-                lea cx,[bp+2]
-                add cx,cx               ; row size in bytes
-                BLKCP                   ; widest copy of the build (36)
-                AdvRow si
-                dec dx
-        .untilz
-        pop ds
+        SaveBox
         ; draw the window (ES=video). AH carries ATTR_POP through the
         ; whole draw: nothing clobbers AX any more (fix 33).
         mov ax,vSeg
         mov es,ax
         mov di,popOff
-        mov ax,A_POP or 0C9h
-        stosw
-        mov al,0CDh
-        mov cx,bp
-        rep stosw
-        mov al,0BBh
-        stosw
-        AdvRow di
+        BoxTop
         xor si,si                       ; blank row
         call PopLine
         mov cx,popLines                 ; BX still holds the line table
@@ -6971,29 +7038,10 @@ PopUp proc uses bx cx dx si di bp
         loop @@ln
         xor si,si                       ; blank row
         call PopLine
-        mov al,0C8h
-        stosw
-        mov al,0CDh
-        mov cx,bp
-        rep stosw
-        mov al,0BCh
-        stosw
+        BoxBot
         ; wait for any key (BIOS ring, INT 28h while idle)
         call ReadKey
-        ; restore the saved region (DS=data, ES=video)
-        mov ax,vSeg
-        mov es,ax
-        mov di,popOff
-        mov si,offset popSave
-        mov dx,popLines
-        add dx,4
-        .repeat                         ; one row per pass (72)
-                lea cx,[bp+2]
-                add cx,cx
-                BLKCP
-                AdvRow di
-                dec dx
-        .untilz
+        RestBox popLines, 4               ; rows = lines + 4 (fix 33: DS data)
         .if (mPres)
                 mov ax,1
                 int 33h
@@ -7196,48 +7244,17 @@ PopAsk proc uses bx dx si di bp
         shr ax,1
         mov popCol,ax
         mov popRow,8                    ; 3.10: direct imm (was mov ax,8 / mov popRow,ax)
-        mov di,popRow
-        shl di,5
-        mov ax,di
-        shl ax,2
-        add di,ax
-        mov ax,popCol
-        shl ax,1
-        add di,ax
-        mov popOff,di
+        PopCorner
         .if (mPres)
                 mov ax,2
                 int 33h
         .endif
         mov dx,4
-        push es, ds                   ; the save loop - SI becomes its video
-        push si                       ; cursor, so fix 173 parks the prompt
-        mov si,popOff                 ; pointer on the stack: 2.00 painted
-        mov ax,vSeg                   ; the prompt row from CODE BYTES
-        mov ds,ax                     ; (garbage) once the loop was done
-        mov ax,ss
-        mov es,ax
-        mov di,offset popSave
-        .repeat
-                lea cx,[bp+2]
-                add cx,cx
-                BLKCP
-                AdvRow si
-                dec dx
-        .untilz
-        pop si                        ; fix 173: the prompt pointer back
-        pop ds
+        SaveBox si                      ; fix 173: the prompt pointer rides the loop
         mov ax,vSeg
         mov es,ax
         mov di,popOff
-        mov ax,A_POP or 0C9h
-        stosw
-        mov al,0CDh
-        mov cx,bp
-        rep stosw
-        mov al,0BBh
-        stosw
-        AdvRow di
+        BoxTop
         mov ah,ATTR_POP
         mov al,0BAh
         stosw
@@ -7263,13 +7280,7 @@ PopAsk proc uses bx dx si di bp
         stosw
         AdvRow di
         mov ah,ATTR_POP
-        mov al,0C8h
-        stosw
-        mov al,0CDh
-        mov cx,bp
-        rep stosw
-        mov al,0BCh
-        stosw
+        BoxBot
 @@in:   call ReadKey
         .if (al==0Dh)                   ; 2.02g (fix 237): one .if chain -
                 jmp @@done              ; the same compares in the same
@@ -7301,18 +7312,7 @@ PopAsk proc uses bx dx si di bp
         mov bx,word ptr askBuf
         add bx,cx
         mov byte ptr [bx],0
-        mov ax,vSeg
-        mov es,ax
-        mov di,popOff
-        mov si,offset popSave
-        mov dx,4
-        .repeat
-                lea cx,[bp+2]
-                add cx,cx
-                BLKCP
-                AdvRow di
-                dec dx
-        .untilz
+        RestBox 4
         .if (mPres)                   ; show the mouse BEFORE snapping CX:
                 mov ax,1              ; 2.02: INT 33h AX=1 should preserve CX
                 int 33h               ; but some clone drivers are sloppy -
