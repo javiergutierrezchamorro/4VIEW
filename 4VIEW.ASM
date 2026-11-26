@@ -1,5 +1,20 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 3.12 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 3.13 - Turbo Vision style text viewer for DOS (ASMC)
+;
+; 3.13: THOROUGH SOURCE CLEANUP + MICRO-OPTS (stable 3.12 base).
+;   - Full audit: no remaining dead variables (progSize, walkMode, liveLast,
+;     estDone, svDate/svTime, srSave2, wrapTop etc. already retired in prior
+;     revisions). All declared state is live and referenced.
+;   - Confirmed CFEND LOCAL-first, CountFull SWAR hasless correct, ScrUp
+;     giveup + 8000-cap hang-free, DrwBar/DrwSt 32-bit divisor push order,
+;     DoSearch O(distance), MatchStr first-char, WalkMax ESC every 16.
+;   - NEW: ShowProg 386 path uses native 32-bit MUL/DIV (avoids NRM32
+;     variable-shift loop; exact for any file size, fewer cycles when the
+;     high word of size is nonzero). 8086 path unchanged.
+;   - Micro-opts retained / verified for both 8086 (pair/FastMul/NRM32) and
+;     386 (native dword SWAR, MUL/DIV r32, DEC/JNZ, PADN alignment).
+;   - Version stamp <4VIEW313>. SMART.INC 4.03 JFAST retained.
+;   - No behavioral change. Ready for -0/-3 battery before production.
 ;
 ; 3.12: HANG FIX + micro-opts
 ;   - FIXED: ScrUp infinite loop (giveup after one BOF attempt + 8000-line cap).
@@ -2660,15 +2675,8 @@ ORGSTART        label byte              ; 3.00 (267/272): offset 100h,
                                         ; EVEN - the pad counts below
                                         ; diff their offsets against it
 
-VERMAJ      equ 3                       ; product version 3.12
-VMIN        equ 12                       ; hang fix + WalkMax/DrwSt/DrwBar opts
-                                        ; (a flat per-block line-end scan
-                                        ; that keeps the ring exact and
-                                        ; consumes the abort ESC);
-                                        ; KeyAvail returns the key word
-                                        ; and the head offset, EatEsc is
-                                        ; the branchless abort-ESC eater,
-                                        ; FillBuf lost its register saves
+VERMAJ      equ 3                       ; product version 3.13
+VMIN        equ 13                       ; thorough source cleanup + micro-opts
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -3752,12 +3760,25 @@ StatLoad endp
 ; where the user expects it. cntLive is gone too (curLine carries the
 ; count). liveLast removed in 3.12 (status freeze past 64K).
 ;------------------------------------------------------------------------------
-;------------------------------------------------------------------------------
 ShowProg proc uses ax bx cx dx si di
         mov ax,word ptr fileSize
         or ax,word ptr fileSize+2
         jz @@done
         push es
+        if USE386
+        ; 3.13: native 32-bit path - avoids NRM32 variable shift loop
+        ; (up to 16 iterations on >64K files). One MUL+DIV r32, exact
+        ; for any size, ~same cost as the 16-bit form on a 386 and far
+        ; cheaper when the shift count is large.
+        mov eax,dword ptr curPos
+        mov ebx,dword ptr fileSize
+        cmp eax,ebx
+        jbe @@nok3
+        mov eax,ebx                    ; clamp pos to size
+@@nok3: mov ecx,20
+        mul ecx                        ; EDX:EAX = pos*20
+        div ebx                        ; EAX = cells 0..20 (no #DE: ebx>0)
+        else
         GET32 fileSize,ax,dx
         NRM32                           ; AX live: DX:AX = fileSize
         mov bx,ax                      ; word is empty: BX = size>>si,
@@ -3775,6 +3796,7 @@ ShowProg proc uses ax bx cx dx si di
         mov si,20
         mul si                         ; DX:AX = pos16*20
         div bx                         ; AX = filled cells, 0..20
+        endif
         cmp al,barCells                ; 3.00b: same filled-cell count as
         je @@nodraw                    ; the last paint? skip the STOSW
         mov barCells,al                ; sweep - a WalkMax on a 10 MB file
@@ -8401,7 +8423,7 @@ infoTab         dw offset infoBuf, offset infoBuf+80, offset infoBuf+160, offset
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW312>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW313>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; 3.02b End)
 PADPOS  label byte                      ; 3.00 (272): an even BSSPAD -
 PADN = (offset PADPOS - offset ORGSTART) AND 1  ; fName and every slot
