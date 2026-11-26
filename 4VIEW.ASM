@@ -1,6 +1,14 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 3.10 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 3.12 - Turbo Vision style text viewer for DOS (ASMC)
 ;
+; 3.12: HANG FIX + micro-opts
+;   - FIXED: ScrUp infinite loop (giveup after one BOF attempt + 8000-line cap).
+;   - FIXED: CountFull liveLast removed (status freeze past 64K lines).
+;   - FIXED: End flushes BIOS keyboard ring (typematic re-entered CountFull).
+;   - Home: resets ring/cache state then SeekSoft (@@hard when bBase near EOF).
+;   - OPT: WalkMax ESC poll every 16 lines (test di,0Fh).
+;;   - CFEND: LOCAL is first statement (ASMC A2012).
+;   - NOT kept: CachePos/CFEND branchless inc (SBB polarity oscillated).
 ; 3.10: POST-REVIEW - source-level verification of 3.09 fixes. Critical paths
 ;       (RdLine SWAR/pair, CountFull, MatchStr first-char, O(distance) DoSearch)
 ;       confirmed optimal. SMART.INC 4.03 JFAST retained. Micro-cleanups:
@@ -2652,8 +2660,8 @@ ORGSTART        label byte              ; 3.00 (267/272): offset 100h,
                                         ; EVEN - the pad counts below
                                         ; diff their offsets against it
 
-VERMAJ      equ 3                       ; product version 3.04 - End's
-VMIN        equ 10                       ; unknown-total pass is CountFull
+VERMAJ      equ 3                       ; product version 3.12
+VMIN        equ 12                       ; hang fix + WalkMax/DrwSt/DrwBar opts
                                         ; (a flat per-block line-end scan
                                         ; that keeps the ring exact and
                                         ; consumes the abort ESC);
@@ -3742,7 +3750,7 @@ StatLoad endp
 ; "PgDn F1=Help" text). CountFull's @@refill now mirrors DI:BP into
 ; curLine and calls DrwSt directly - one painter, one field, the count
 ; where the user expects it. cntLive is gone too (curLine carries the
-; count); liveLast stays as the throttle. See the @@refill comment.
+; count). liveLast removed in 3.12 (status freeze past 64K).
 ;------------------------------------------------------------------------------
 ;------------------------------------------------------------------------------
 ShowProg proc uses ax bx cx dx si di
@@ -3877,38 +3885,26 @@ SeekSoft endp
 LoadFirst proc
         CLR32 totLines
         CLR32 curPos
-        ; 3.07b: the explicit frontier reset (mov cfValid,0 / CLR32 cfPos /
-        ; CLR32 cfLines) is REMOVED from here to isolate the startup hang.
-        ; The three variables live inside zStart..zEnd, so Init's rep stosb
-        ; zero-pass already clears them at COM startup - a fresh file open
-        ; starts with cfValid=0/cfPos=0/cfLines=0 either way. The explicit
-        ; reset only mattered for a SAME-SESSION re-open (re-init), which
-        ; never happens in this one-file COM. Removing it changes no
-        ; observable behavior at startup, and shrinks the delta that runs
-        ; during the hang window.
         call SeekSoft
         .while (word ptr totLines < LINES_VIS)
-                ; curPos IS the start of this line here (the previous
-                ; RdLine stopped exactly on it), so VPSTORE needs no
-                ; saved copy - the SAVEPOS tmpPos of the draft was dead
                 mov bx,word ptr totLines
                 SLOTPTR di,offset vCache,bl
                 mov wDest,di
                 mov si,word ptr totLines
-                shl si,2                ; vPos entry of this line
+                shl si,2
                 VPSTORE si
                 call RdLine
-                mov wDest,offset lBuf   ; re-arm for everyone else (146)
-                .break .if (!al)        ; EOF: the count is final
+                mov wDest,offset lBuf
+                .break .if (!al)
                 INC32 totLines
         .endw
         .if (word ptr totLines == LINES_VIS)
-                mov si,LINES_VIS*4      ; vPos entry 23: the line below
-                VPSTORE si              ; the view (the first Down's hot
-        .else                           ; read, fix 110)
-                mov eofSeen,1           ; EOF before 23 lines: the total
-        .endif                          ; is final already
-        mov vcValid,1                   ; slots 0..22 hold view #1 (85)
+                mov si,LINES_VIS*4
+                VPSTORE si
+        .else
+                mov eofSeen,1
+        .endif
+        mov vcValid,1
         CLR32 vcTop
         mov vSlot,0
         mov cCnt,0
@@ -4042,24 +4038,25 @@ Main proc
                         mov hPos,0
                         CLR32 curPos
                         mov cCnt,0
-                        mov vcValid,0           ; force cold rebuild from BOF
-                        mov tailEnd,0           ; 3.02c: allow future finalize
+                        mov cHead,0
+                        mov vcValid,0
+                        mov tailEnd,0
+                        mov hFull,0
+                        mov cntMode,0
+                        mov wDest,offset lBuf
+                        ; SeekSoft: after End, bBase is near EOF so
+                        ; curPos=0 < bBase takes @@hard (DOS to BOF).
                         call SeekSoft
                         mov al,1
                 .else
-                        ; STDIN (fix 85): Home jumps to the oldest line
-                        ; the ring still holds - a pipe cannot rewind
-                        ; any further. 2.10 (243): the pair sub keeps
-                        ; the fix-102 borrow form on 32-bit totLines
                         GET32 totLines,ax,dx
-                        CLAMP32 @@hc, RSLOTS ; oldest line still in the ring
-                                         ; (102: the borrow IS the "all of them held" case)
+                        CLAMP32 @@hc, RSLOTS
 @@hc:                   CMP32J dx,ax,curLine,@@hm,@@hd
 @@hm:                   SET32 curLine,ax,dx
-                        mov hPos,0              ; 3.00 FIX: the file branch
-                        mov al,1                ; always reset the window -
-@@hd:                                           ; the STDIN branch forgot, and
-                .endif                          ; Home left hPos's offset live
+                        mov hPos,0
+                        mov al,1
+@@hd:
+                .endif
         .case 4Fh                       ; End
                 xor al,al               ; 2.13 (260): the no-move paths
                                         ; (@@hno/@@endn) return with the
@@ -4232,6 +4229,14 @@ Main proc
                                 mov tailEnd,0
                         .endif
                         call SeekSoft
+                        ; Flush BIOS keyboard ring so typematic End
+                        ; does not re-enter CountFull after return.
+                        push ds
+                        mov ax,40h
+                        mov ds,ax
+                        mov ax,ds:[1Ah]
+                        mov ds:[1Ch],ax
+                        pop ds
                         mov al,1
                         jmp @@endn
 @@endpop:               pop bx
@@ -4729,22 +4734,41 @@ ScrUp proc
         test al,al
         jz @@scanend                    ; EOF safety
         inc di
-        jmp @@scan
+        cmp di,8000                     ; 3.12: hard cap - if RdLine keeps
+        jb @@scan                       ; returning AL=1 without curPos
+                                        ; reaching tmpPos, abort the scan
 @@scanend:
         test di,di
         jnz @@moved
-        ; landed exactly on a line start: step back further and retry
+        ; 3.12: MUST NOT loop forever. Old path doubled backAmt then
+        ; @@from0 (backAmt=tmpPos) and, if the rescan still found 0 lines
+        ; (seek failure after End, overflow to 0), retried forever.
         mov ax,word ptr backAmt+2
         test ax,ax
-        jnz @@from0
+        jnz @@trybof
         cmp word ptr backAmt,4096
-        jae @@from0
-        shl word ptr backAmt,1          ; back *= 2
+        jae @@trybof
+        shl word ptr backAmt,1
         rcl word ptr backAmt+2,1
+        mov ax,word ptr backAmt
+        or ax,word ptr backAmt+2
+        jz @@trybof                     ; overflowed to 0
         jmp @@again
-@@from0:
-        CPY32 backAmt,tmpPos             ; rescan from BOF
+@@trybof:
+        mov ax,word ptr backAmt
+        cmp ax,word ptr tmpPos
+        jne @@setbof
+        mov ax,word ptr backAmt+2
+        cmp ax,word ptr tmpPos+2
+        je @@giveup                     ; already tried BOF once
+@@setbof:
+        CPY32 backAmt,tmpPos
         jmp @@again
+@@giveup:
+        RESTPOS tmpPos
+        call SeekSoft
+        xor al,al
+        ret
 @@moved:
         DEC32 curLine                   ; rescan lands exactly one line up:
                                         ; the last cached entry IS line A-1
@@ -5390,21 +5414,19 @@ WalkMax proc
         sub ax,si
         sbb dx,cx
         jae @@done
-        ; 3.01: ESC abort check moved here from FillBuf. FillBuf's peek
-        ; of the BIOS keyboard ring during the walk was causing a false
-        ; EOF at the first 32 KiB boundary (line ~677). The check now
-        ; runs once per LINE (not once per FillBuf), and FillBuf no
-        ; longer touches the keyboard ring at all. 3.04: the peek is
-        ; KeyAvail's return (AX = the key word, BX = the head offset)
-        ; and the abort ESC is CONSUMED (EatEsc) - it no longer leaks
-        ; into Main's poll, where it would quit the viewer.
+        ; 3.12: throttle ESC to every 16 lines. KeyAvail costs a segment
+        ; load + memory each call; long Goto/End walks paid it once per
+        ; line. 16-line latency is still sub-frame. ESC is CONSUMED
+        ; (EatEsc) so it does not leak into Main's poll.
+        test di,0Fh
+        jnz @@noesc
         KeyAvail
         jz @@noesc
         cmp ax,011Bh
-        jne @@noesc             ; not ESC: continue the walk
+        jne @@noesc
         EatEsc
         mov escHit,1
-        jmp @@eof               ; ESC: abort the walk
+        jmp @@eof
 @@noesc:
         call CachePos                   ; record the start of line T
         call RdLine
@@ -5534,11 +5556,6 @@ cfe1:
 ;------------------------------------------------------------------------------
 CountFull proc
         mov cCnt,0
-        ; 3.05: reset the throttle so a fresh pass repaints immediately (the
-        ; first @@refill sees DI:BP = 0 and forces "Line 1/?"). liveLast = a
-        ; value DI's low word never holds at entry (0FFFFh) guarantees the
-        ; first compare misses and DrwSt runs once.
-        mov liveLast,0FFFFh
         ; hard re-anchor at curPos (NOT SeekSoft): the inside-block
         ; reuse leaves bLen>0 with the DOS pointer past the buffered
         ; block, and @@refill's bBase+=bLen would then skip the unread
@@ -5588,29 +5605,12 @@ CountFull proc
         add word ptr bBase,ax
         adc word ptr bBase+2,0
         CPY32 curPos,bBase
-        ; 3.05: mirror DI:BP (the running count of completed block(s)) into
-        ; curLine so DrwSt paints "Line N/?" in the REAL status field (not a
-        ; separate field that clashes with sKey's hint glyphs). DrwSt reads
-        ; curLine, sees eofSeen=0 and shows "?" as the total - exactly the
-        ; "counting..." indicator. DI:BP and SI are live here (DI:BP = the
-        ; count, SI = the last block's scan pointer, about to be reset
-        ; below); DrwSt is `proc uses ax bx cx dx si di` and never touches
-        ; BP, so all of them survive the call. Throttled on liveLast (the
-        ; low word of the count, like ShowProg's barCells) so a steady
-        ; count repaints once per VISIBLE change, not per block. First
-        ; entry: DI:BP = 0, curLine = 0 -> "Line 1/?" (honest "counting...").
-        ; curLine is TEMPORARY here - the End handler overwrites it with
-        ; totLines - LINES_VIS (or 0) after CountFull returns, so this
-        ; mutation is safe and invisible to the view.
-        mov ax,di
-        cmp ax,liveLast
-        je @@cnostat
-        mov liveLast,ax
+        ; 3.12: mirror DI:BP into curLine so DrwSt paints "Line N/?".
+        ; Update every 32 KiB block (natural throttle). liveLast removed.
         SET32 curLine,di,bp
         call DrwSt
-        mov barCells,0FFh               ; 3.08: DrwSt's pad wiped the bar (cols 58..77):
-        call ShowProg                   ; repaint it NOW, not after FillBuf's DOS read
-@@cnostat:
+        mov barCells,0FFh
+        call ShowProg
         call FillBuf
         test ax,ax
         jz @@ceof
@@ -6909,12 +6909,12 @@ DrwSt proc uses ax bx cx dx si di
         div ebx                 ; EAX = percent (<= 100: no #DE)
         else
         NRM32                   ; SI = the shift, AX = totLines >> SI
-        push ax                 ; the normalized divisor parked
+        push ax
         GET32 curLine,ax,dx
-        SHRBY                   ; AX = curLine >> SI (247)
-        FastMul 100             ; DX:AX = curLine'*100
+        SHRBY
+        FastMul 100
         pop bx
-        div bx                  ; AX = percent (no #DE, proven)
+        div bx
         endif
         call U2A
         mov al,'%'
@@ -7921,17 +7921,11 @@ DetectBinary proc uses ax bx cx dx si di es
         .endif
         push ds
         pop es
-        ; 2.02g (fix 234): the hand-written push/pop block is the proc
-        ; uses form - identical bytes, one ret serves every exit.
-        ; fix 179: Init leaves the fresh reader at BOF (DOS pointer =
-        ; bBase = curPos = 0, bLen = 0) - 2.00 seeked to BOF twice for
-        ; nothing. The probe reads through GetByte/FillBuf, so the first
-        ; 32 KiB block STAYS buffered and CountLines scans it without
-        ; paying a single extra DOS read.
+        ; 3.10 original probe restored (startup hang isolation).
         mov di,offset hxBuf
-@@rl:   call GetByte            ; 3.04: FillBuf saves nothing - GetByte's
-        jc @@done               ; refill clobbers CX, so the loop counts
-        mov [di],al             ; with DI against the buffer end
+@@rl:   call GetByte
+        jc @@done
+        mov [di],al
         inc di
         cmp di,offset hxBuf+512
         jb @@rl
@@ -7952,16 +7946,15 @@ DetectBinary proc uses ax bx cx dx si di es
         jb @@bin                   ; 14..31: control
         cmp al,7Eh
         jbe @@ok                   ; 32..126: printable
-@@bin:  inc dx                     ; fix 179: >= 7Fh counts too - 2.00's
-@@ok:   loop @@cl                  ; "jbe/jmp ok" made EVERY byte "ok" and
-                                        ; a file of pure FFh was "text"
-        FastIMul ax,dx,20      ; 2.02g (fix 241): count*20 via the macro -
-        cmp ax,di              ; mov ax,dx + 3 shl + add + shl (~16 cycles
-        jb @@rst               ; on an 8086 vs ~120 for mov bx,20/mul bx,
-        mov binFile,1          ; r16); DX survives (it is the count) and
-@@rst:  mov bIdx,0                  ; BX is no longer touched at all. fix
-        mov hFull,0                 ; 179: rewind INSIDE the buffered
-        CLR32 curPos                     ; block: no seek, no refill - LoadFirst reuses the block the probe loaded
+@@bin:  inc dx                     ; >= 7Fh counts (fix 179)
+@@ok:   loop @@cl
+        FastIMul ax,dx,20
+        cmp ax,di
+        jb @@rst
+        mov binFile,1
+@@rst:  mov bIdx,0
+        mov hFull,0
+        CLR32 curPos
         ret
 DetectBinary endp
 
@@ -8197,14 +8190,6 @@ totLines        dd 0                    ; 2.10 (243): 32-bit. 3.00: the
                                         ; highest line PROVEN so far -
                                         ; it only grows on demand, and
                                         ; eofSeen makes it final
-liveLast        dw 0FFFFh               ; 3.06: the low-word of curLine that
-                                        ; CountFull's @@refill last painted
-                                        ; via DrwSt - the throttle mirrors
-                                        ; ShowProg's barCells, one repaint
-                                        ; only when the visible count changes
-                                        ; (3.05's cntLive is gone: curLine now
-                                        ; carries the count for DrwSt's "Line
-                                        ; N/?" field, the real status bar)
 bBase           dd 0
 vcTop           dd 0                    ; view cache: top line number (63;
                                         ; 2.10 (243): 32-bit like curLine)
@@ -8416,7 +8401,7 @@ infoTab         dw offset infoBuf, offset infoBuf+80, offset infoBuf+160, offset
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW310>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW312>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; 3.02b End)
 PADPOS  label byte                      ; 3.00 (272): an even BSSPAD -
 PADN = (offset PADPOS - offset ORGSTART) AND 1  ; fName and every slot
