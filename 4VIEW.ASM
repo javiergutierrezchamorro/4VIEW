@@ -1,5 +1,55 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 3.13 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 3.15 - Turbo Vision style text viewer for DOS (ASMC)
+;
+; 3.15: COMPATIBILITY + FINAL DEAD-CODE SWEEP + MICRO-CLEANUPS.
+;   - FIXED: JFAST/JNATIVE required SMART.INC >= 4.03. The shipped
+;     smart.inc is v4.02 (__SMART_INC__=402), so the old condition
+;     never activated and a forced JNATIVE would have been an undefined
+;     symbol. Now: when >= 403 call JNATIVE; on 4.02 and earlier the
+;     SMART trampolines stay (correct, never "too far"). Clear comment.
+;   - CONFIRMED dead (already gone from live code, only historical notes
+;     remain): tailEnd, progSize, walkMode, liveLast, estDone,
+;     svDate/svTime, srSave2, wrapTop, @@cfres, the dead INC SI in
+;     ParseCmd. No further live references found by full-source scan.
+;   - MICRO: version stamp and FILEEND updated to <4VIEW315>; header
+;     notes the 4.02-compatible JFAST path. No behavioural change.
+;   - Version stamp <4VIEW315>. Assemble with -0 and -3 and run the
+;     usual battery before shipping.
+;
+; 3.14: REVIEW PASS - REAL BUGS FIXED, DEAD STATE REMOVED, SMALL SPEED-UPS.
+;   - FIXED: the AT typematic speed-up never ran. Init called INT 15h with
+;     AX=0C00h (AH=0Ch, an unknown function) instead of AH=0C0h (get system
+;     configuration), so the call always failed and svType stayed 0. It also
+;     loaded only BL for INT 16h AX=0305h: that call takes the DELAY in BH
+;     and the RATE in BL (BH held garbage), and Done restored with BL=22h
+;     (24 cps) instead of the AT default (500 ms / 10 cps). Now: STC before
+;     INT 15h/C0h (an IRET stub leaves CF alone), BX=0000h to set 30 cps /
+;     250 ms, BX=010Ch to restore.
+;   - FIXED: Ctrl+P (print) at the top of the file broke the reader. The raw
+;     INT 21h reads of PrintFile moved the DOS file pointer to EOF while
+;     bBase/bLen stayed 0; at curPos=0 SeekSoft took its "exactly at the
+;     block end" path (no DOS seek), the next refill read at EOF, the viewer
+;     believed the file had 23 lines (eofSeen). PrintFile now invalidates
+;     bBase (DROPBUF) so SeekSoft re-seeks for real.
+;   - FIXED: Right and Ctrl+Right at the right edge returned the low byte of
+;     hPos in AL (the "mov ax,hPos" compare), a non-zero "moved" flag: a
+;     useless full repaint on every typematic repeat. They compare the
+;     memory word now and keep AL=0.
+;   - FIXED: Info (I) printed the file time without leading zeros ("12:5"
+;     for 12:05, "1-2-2026"). New U2A2 prints day/month/hour/minute as two
+;     digits (AAM, one STOSW).
+;   - FIXED: Init called INT 33h blindly. On plain DOS without a mouse
+;     driver the vector is 0000:0000 (or an IRET stub): the call jumped to
+;     0000:0000 and hung. The vector is checked first (AX=3533h).
+;   - REMOVED (dead): tailEnd (set to 0 in three places, never to 1 since
+;     3.04 replaced the near-end End; the @@seof test was always true),
+;     the unused @@cfres label, a dead INC SI in ParseCmd.
+;   - DATA LAYOUT: cfPos/cfLines joined the dword group and the post-zEnd
+;     words now precede the bytes, so every dword/word stays even-aligned
+;     (wDest is read several times per line) without tailEnd's byte.
+;   - FASTER: DoSearch polled the keyboard ring once per LINE (a segment
+;     load + 3 memory reads per line); now once per 16 lines, like WalkMax.
+;   - Version stamp <4VIEW314>.
 ;
 ; 3.13: THOROUGH SOURCE CLEANUP + MICRO-OPTS (stable 3.12 base).
 ;   - Full audit: no remaining dead variables (progSize, walkMode, liveLast,
@@ -2654,18 +2704,25 @@ include smart.inc               ; shl/shr imm, movzx, FastMul, push/pop
                                 ; no bare ".break .ifnz" below (262).
 
 ;------------------------------------------------------------------------------
-; 3.09: JFAST=1 hands FORWARD and external conditional jumps to the assembler
-; (OPTION LJMP lengthens only the ones that really do not reach). SMART.INC
-; v3.4-v4.02 turned EVERY forward Jcc of the 8086 build into "j<inv> over /
-; jmp target": +3 bytes each and the common (not-taken) path became a TAKEN
-; jump, 16 clocks instead of 4 - inside RdLine/CountFull/WrCntRow on an 8086.
-; The 386 build never needed it (SMART.INC passes Jcc through there). If the
-; assembler ever answers "jump destination too far" set JFAST to 0.
+; 3.09 / 3.15: JFAST=1 hands FORWARD and external conditional jumps to the
+; assembler when SMART.INC supports it. SMART.INC v3.4-v4.02 turned EVERY
+; forward Jcc of the 8086 build into "j<inv> over / jmp target": +3 bytes
+; each and the common (not-taken) path became a TAKEN jump (16 clocks
+; instead of 4) inside RdLine/CountFull/WrCntRow. The 386 build never
+; needed it (SMART.INC passes Jcc through there).
+; 3.15: SMART.INC 4.03 introduced JNATIVE; the shipped copy is still 4.02
+; (__SMART_INC__=402). Call JNATIVE only when available; on 4.02 and
+; earlier keep the safe SMART trampolines (never "jump destination too
+; far"). Set JFAST to 0 only if the extra 3 bytes per forward jump matter
+; more than the cycle cost of the trampoline on the common path.
 ;------------------------------------------------------------------------------
 JFAST   equ 1
 ifdef __SMART_INC__
-if JFAST AND (__SMART_INC__ GE 403)   ; needs SMART.INC 4.03 (older copies: skipped)
-        JNATIVE
+if JFAST
+  if (__SMART_INC__ GE 403)
+        JNATIVE                 ; SMART.INC 4.03+: hand forward Jcc to assembler
+  endif
+  ; else: SMART.INC <= 4.02 - trampolines remain (correct & safe)
 endif
 endif
 
@@ -2675,8 +2732,8 @@ ORGSTART        label byte              ; 3.00 (267/272): offset 100h,
                                         ; EVEN - the pad counts below
                                         ; diff their offsets against it
 
-VERMAJ      equ 3                       ; product version 3.13
-VMIN        equ 13                       ; thorough source cleanup + micro-opts
+VERMAJ      equ 3                       ; product version 3.15
+VMIN        equ 15                       ; 4.02-compatible JFAST + final dead-code sweep
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -2825,6 +2882,18 @@ VPSTORE macro reg
         mov word ptr vPos[reg],ax
         mov ax,word ptr curPos+2
         mov word ptr vPos[reg+2],ax
+        endm
+
+;------------------------------------------------------------------------------
+; DROPBUF - 3.14: invalidate the reader's block after the DOS file pointer
+; was moved behind its back (PrintFile's raw reads). bBase = 0FFFFFFFFh makes
+; curPos < bBase for every real position, so the next SeekSoft takes @@hard
+; (a real AH=42h seek) - with bBase=0/bLen=0 and curPos=0 it took @@empty,
+; skipped the seek and the refill read at the old EOF.
+;------------------------------------------------------------------------------
+DROPBUF macro
+        mov word ptr bBase,0FFFFh
+        mov word ptr bBase+2,0FFFFh
         endm
 
 ;------------------------------------------------------------------------------
@@ -3347,7 +3416,6 @@ ParseCmd proc
                 ret
         .endif
         .if (al=='-' || al=='/')
-                inc si
                 stc                     ; -h, /? or any other option:
                 ret                     ; help (fix 45: dead code dropped)
         .endif
@@ -3423,7 +3491,11 @@ Init proc
         ; and left alone; Done restores the IBM default (BL=22h).
         mov svType,0                  ; assume no typematic change
         push es
-        mov ax,0C00h                  ; INT 15h AH=0Ch: get system config
+        mov ah,0C0h                   ; INT 15h AH=C0h: get system config
+        stc                           ; 3.14: was "mov ax,0C00h" (AH=0Ch, an
+                                      ; unknown function: it never worked).
+                                      ; An IRET stub leaves CF alone, so
+                                      ; preset it: unsupported stays CF=1
         int 15h
         jnc @@atk_chk                 ; CF=0: AT+, check model byte
         pop es                        ; PC/XT: function not supported
@@ -3443,8 +3515,8 @@ Init proc
         ; AT+ detected: set typematic to maximum speed
         mov svType,1                  ; remember to restore on exit
         mov ax,0305h                  ; INT 16h AH=03h AL=05h: set rate
-        xor bl,bl                     ; BL=0: 30 cps, 250 ms delay
-        int 16h
+        xor bx,bx                     ; 3.14: BH=0 (250 ms delay) AND BL=0
+        int 16h                       ; (30 cps) - BH was left as garbage
 @@atk_done:
 
         ; validate the video mode (BIOS data 0040:0049) and pick the
@@ -3595,7 +3667,16 @@ Init proc
                 .endif                  ; text capture is simply unused
         .endif
 
-        ; mouse
+        ; mouse: INT 33h is called only when a driver hooked it (3.14). On
+        ; plain DOS the vector is 0000:0000 or an IRET stub - calling it
+        ; jumped to 0000:0000 and hung the machine.
+        mov ax,3533h
+        int 21h                         ; ES:BX = the INT 33h vector
+        mov ax,es
+        or ax,bx
+        jz @@nomse                      ; null vector: no driver
+        cmp byte ptr es:[bx],0CFh
+        je @@nomse                      ; IRET stub: no driver either
         xor ax,ax
         int 33h
         .if (ax)
@@ -3603,6 +3684,9 @@ Init proc
                 mov ax,1
                 int 33h
         .endif
+@@nomse:
+        push ds
+        pop es                          ; ES=DS, as before this check
         ret
 Init endp
 
@@ -4062,7 +4146,6 @@ Main proc
                         mov cCnt,0
                         mov cHead,0
                         mov vcValid,0
-                        mov tailEnd,0
                         mov hFull,0
                         mov cntMode,0
                         mov wDest,offset lBuf
@@ -4195,7 +4278,7 @@ Main proc
                                         jc @@cfbof        ; cfPos < BACKSCAN: BOF
                                         add ax,BACKSCAN   ; restore cfPos (the sub
                                         adc dx,0          ; was just a threshold test)
-@@cfres:                                SET32 curPos,ax,dx
+                                        SET32 curPos,ax,dx
 @@cfgo:                                 mov vcValid,0           ; one pass,
                                         call CountFull          ; from curPos
                                 .else
@@ -4231,7 +4314,6 @@ Main proc
                         .if (bl)
                                 CPY32 totLines,tmpPos   ; exact total back
                                 mov eofSeen,1
-                                mov tailEnd,0
                                 ; curLine already set to tot-VIS above
                         .else
                                 ; 3.04: CountFull grew totLines itself -
@@ -4248,7 +4330,6 @@ Main proc
                                 mov dx,bp
                                 CLAMP32 @@ucl, LINES_VIS 
 @@ucl:                          SET32 curLine,ax,dx
-                                mov tailEnd,0
                         .endif
                         call SeekSoft
                         ; Flush BIOS keyboard ring so typematic End
@@ -4303,11 +4384,10 @@ Main proc
         .case 4Dh                       ; Right: one column right (47)
                 xor al,al
                 .if (!wrapOn)
-                        mov ax,hPos
-                        .if (ax < HPOSMAX)
-                                inc hPos
-                                mov al,1
-                        .endif
+                        .if (hPos < HPOSMAX)    ; 3.14: compare the memory
+                                inc hPos        ; word - "mov ax,hPos" left
+                                mov al,1        ; AL=low(hPos) = a phantom
+                        .endif                  ; "moved" at the right edge
                 .endif
         .case 73h                       ; Ctrl+Left: ten columns (47)
                 xor al,al
@@ -4323,11 +4403,10 @@ Main proc
         .case 74h                       ; Ctrl+Right: ten columns (47)
                 xor al,al
                 .if (!wrapOn)
-                        mov ax,hPos
-                        .if (ax < HPOSMAX-10)
+                        .if (hPos < HPOSMAX-10) ; 3.14: see Right
                                 add hPos,10
                                 mov al,1
-                        .elseif (ax < HPOSMAX)
+                        .elseif (hPos < HPOSMAX)
                                 mov hPos,HPOSMAX
                                 mov al,1
                         .endif
@@ -4908,12 +4987,10 @@ ScrDn proc
 @@fg1:          SET32 totLines,ax,dx
 @@fk:           mov al,1
                 ret
-@@seof:         .if (!tailEnd)          ; 3.02c: unknown-End parked us at
-                        mov eofSeen,1   ; the true EOF with only a relative
-                .endif                  ; count - do not finalize until Home
-                jmp @@s                 ; (or a full BOF discovery) clears
-                                        ; tailEnd. Otherwise totLines locks
-                                        ; at ~677 and growth is blocked.
+@@seof:         mov eofSeen,1           ; 3.14: the frontier read hit the
+                jmp @@s                 ; real EOF: the total is final
+                                        ; (tailEnd, the 3.02c guard, was
+                                        ; never set since 3.04: retired)
         .else
                 GET32 curLine,ax,dx
                 add ax,LINES_VIS
@@ -7135,8 +7212,9 @@ Done proc
         ; fix 171: restore typematic rate to IBM AT default
         .if (svType)
                 mov ax,0305h          ; INT 16h AH=03h AL=05h
-                mov bl,22h            ; 500 ms delay, ~10 cps (AT default)
-                int 16h
+                mov bx,010Ch          ; 3.14: BH=1: 500 ms delay, BL=0Ch:
+                int 16h               ; ~10 cps (the AT default); 22h was
+                                      ; 24 cps and BH was never loaded
         .endif
         .if (hFile)
                 mov bx,hFile
@@ -7251,6 +7329,19 @@ U2A proc uses bx cx dx si
         ret
         endif
 U2A endp
+
+;------------------------------------------------------------------------------
+; U2A2 - AX = 0..99 as TWO decimal digits at ES:DI (3.14: the file date/time
+; of ShowInfo; U2A printed "12:5" for 12:05). AAM splits AL into AH=tens,
+; AL=units (AH is not read); the swap puts the tens first in memory.
+;------------------------------------------------------------------------------
+U2A2 proc
+        aam
+        xchg al,ah
+        add ax,3030h
+        stosw
+        ret
+U2A2 endp
 
 ;==============================================================================
 ; 2.00 NEW PROCS
@@ -7591,13 +7682,13 @@ ShowInfo proc uses ax bx cx dx di si es
                         call Cpy
                         mov ax,bx
                         and ax,1Fh            ; day of month
-                        call U2A
+                        call U2A2             ; 3.14: two digits
                         mov al,'-'
                         stosb
                         mov ax,bx
                         shr ax,5              ; month (SMART.INC: faster than mov cl,5)
                         and ax,0Fh
-                        call U2A
+                        call U2A2
                         mov al,'-'
                         stosb
                         mov ax,bx
@@ -7609,13 +7700,13 @@ ShowInfo proc uses ax bx cx dx di si es
                         mov bx,dx                                ; DX survives Cpy/U2A (uses, 276)
                         mov ax,bx
                         shr ax,11             ; hour (SMART.INC macro)
-                        call U2A
+                        call U2A2
                         mov al,':'
                         stosb
                         mov ax,bx
                         shr ax,5              ; minute
                         and ax,3Fh
-                        call U2A
+                        call U2A2
                 .endif
         .endif
         mov byte ptr [di],0
@@ -7702,12 +7793,14 @@ PrintFile proc uses ax bx cx dx si di es
         mov bx,word ptr prnH
         mov ah,3Eh
         int 21h
+        DROPBUF                       ; 3.14: the DOS pointer sits at EOF
         RESTPOS prnSave
         call SeekSoft
         ret
 @@err2: mov bx,word ptr prnH
         mov ah,3Eh
         int 21h
+        DROPBUF                       ; 3.14: same, after a failed read/write
 @@err:  RESTPOS prnSave               ; fix 178
         call SeekSoft
         mov bx,offset errTab
@@ -7775,7 +7868,9 @@ DoSearch proc uses bx cx dx si di bp
         .endif
         mov wDest,offset lBuf
         SET32 srLine,0FFFFh,0FFFFh       ; the match line waits in MEMORY (250)
-@@l:    KeyAvail
+@@l:    test di,0Fh                     ; 3.14: poll the key ring every 16th
+        jnz @@cont                      ; line only (WalkMax's cadence) - it
+        KeyAvail                        ; cost a segment load + 3 reads/line
         jz @@cont
         cmp ax,011Bh                    ; 3.04: the peek is KeyAvail's
         jne @@drain                     ; return (AX = key, BX = head) and
@@ -8201,6 +8296,13 @@ HexB endp
 ; 3.00 (271): the block is reordered dwords/words/bytes so every
 ; 32-bit pair sits on an even offset with no padding wasted - the
 ; REP STOSB clear above is untouched, only the layout changed.
+ZPAD0           label byte              ; 3.14/3.15: even-align the state block
+ZPN = (offset ZPAD0 - offset ORGSTART) AND 1    ; (the 272 idiom: no ALIGN -
+ZPAD            db ZPN dup(0)           ; illegal in .model tiny, no $ in IF);
+                                        ; the code above changes size with
+                                        ; every edit and zStart's parity
+                                        ; followed it - dwords and words
+                                        ; stay word-aligned for any size
 zStart          label byte
 curPos          dd 0
 savPos          dd 0
@@ -8222,6 +8324,13 @@ srLine          dd 0                    ; 2.10 (250): DoSearch's match
 srPos           dd 0                    ; 3.09: start of the hit line (DoSearch)
 srTmp           dd 0                    ; 3.09: start of the line being read
 fileSize        dd 0
+cfPos           dd 0                    ; 3.07: the frontier byte offset (the
+                                        ; start of the next uncounted line,
+                                        ; materialized by @@cabort = curPos)
+cfLines         dd 0                    ; 3.07: the line count PROVEN at cfPos
+                                        ; (DI:BP at the abort). CountFull starts
+                                        ; DI:BP = cfLines so the running total
+                                        ; is absolute, not relative to cfPos
 hFile           dw 0
 cCnt            dw 0
 cHead           dw 0                    ; scroll ring: next write slot,
@@ -8258,11 +8367,6 @@ srCase          db 0
 srValid         db 0
 eofSeen         db 0                    ; 3.00: a read proved the file's
                                         ; end - totLines is final
-tailEnd         db 0                    ; 3.02c: End with unknown total
-                                        ; parked the view at the true EOF
-                                        ; without an absolute count; ScrDn
-                                        ; must not finalize eofSeen until
-                                        ; Home (or a BOF walk) clears this
 escHit          db 0                    ; 3.00: the walk was ESC-aborted
 cfCR            db 0                    ; 3.04: CountFull's CR pending at a
                                         ; block edge - the next block's
@@ -8277,13 +8381,6 @@ cfValid         db 0                    ; 3.07: a saved count frontier exists
                                         ; file open (LoadFirst) and when the
                                         ; count reaches EOF (the total is final,
                                         ; nothing to resume).
-cfPos           dd 0                    ; 3.07: the frontier byte offset (the
-                                        ; start of the next uncounted line,
-                                        ; materialized by @@cabort = curPos)
-cfLines         dd 0                    ; 3.07: the line count PROVEN at cfPos
-                                        ; (DI:BP at the abort). CountFull starts
-                                        ; DI:BP = cfLines so the running total
-                                        ; is absolute, not relative to cfPos
 lfnAvail        db 0                    ; 3.00: AX=71A0h reported LFN
 rowCnt          db 0                    ; 3.00: DrwCnt's proven-line count
 barCells        db 0                    ; 3.00b: ShowProg's last filled-cell
@@ -8297,16 +8394,18 @@ srPat           db 32 dup(0)
 askTmp          db 32 dup(0)            ; 3.09: PopAsk's typing buffer for the search prompts
 gtBuf           db 12 dup(0)            ; 3.09: the Goto prompt (10 digits + NUL)
 zEnd            label byte
-isFile          db 0            ; set by ParseCmd: NEVER zeroed by Init
 wDest           dw offset lBuf ; RdLine store target (63): pointer,
                                 ; deliberately outside the Init-cleared
-                                ; block (fix 63)
+                                ; block (fix 63). 3.14: the words come
+                                ; first, so wDest/vSeg stay even-aligned
+                                ; whatever the byte count of the block above
 vSeg            dw 0B800h       ; Init sets B000h for mono (mode 7)
+svShape         dw 0
+svCurs          dw 0
+isFile          db 0            ; set by ParseCmd: NEVER zeroed by Init
 svPage          db 0
 svMode          db 0                    ; video mode at entry (fix 71)
 svForced        db 0                    ; Init forced mode 3 (fix 71)
-svShape         dw 0
-svCurs          dw 0
 svType          db 0            ; fix 171: typematic rate changed,
                                 ; restore on exit (AT+ only)
 sSTDIN          db "STDIN",0
@@ -8423,7 +8522,7 @@ infoTab         dw offset infoBuf, offset infoBuf+80, offset infoBuf+160, offset
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW313>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW315>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; 3.02b End)
 PADPOS  label byte                      ; 3.00 (272): an even BSSPAD -
 PADN = (offset PADPOS - offset ORGSTART) AND 1  ; fName and every slot
