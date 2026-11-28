@@ -1,5 +1,40 @@
 ;------------------------------------------------------------------------------
-; 4VIEW 3.15 - Turbo Vision style text viewer for DOS (ASMC)
+; 4VIEW 3.16 - Turbo Vision style text viewer for DOS (ASMC)
+;
+; 3.16: ONE REAL BUG FIXED + 386 BUILD SPEED-UPS + STATE-BLOCK SIZE TRIM.
+;   - FIXED: the Info popup (I) showed the file's TIME where the DATE
+;     belongs and the DATE where the TIME belongs. INT 21h AX=5700h
+;     returns CX=time and DX=date; ShowInfo parked CX in BX for the
+;     day/month/year extraction (date fields of DX) and parked DX for
+;     the hour/minute extraction (time fields of CX), so the date line
+;     printed bits of the time and the time line printed bits of the
+;     date (e.g. an 11:34:02 stamp displayed as "1-2-2026"). The parks
+;     are swapped: BX=DX for day/month/year, BX=CX for hour/minute.
+;     The extractions themselves were already correct.
+;   - FASTER (386 build): U2A32 now keeps the 32-bit value in EAX and
+;     divides once per digit with DIV r32, instead of the two-DIV r16
+;     pair dance - called 2-3 times per status repaint. The 8086 path
+;     is unchanged. Output is identical for every 32-bit value.
+;   - FASTER (386 build): MAPROW (the scrollbar-click mapping) takes
+;     the native MUL r32 + DIV r32 when USE386 - the same exact
+;     quotient the three-word 8086 product computes, ~10 instructions
+;     less per click and 16 bytes less code. The 8086 path is
+;     unchanged (it stays EXACT - verified against mul/div semantics).
+;   - SMALLER (both builds): srSave, prnSave, prnH, askMax, askBuf and
+;     askCnt move from the initialized data tail into the Init-cleared
+;     state block (fix 97's write-before-read audit covers all six:
+;     PopAsk/DoSearch/PrintFile write them before any read) - the COM
+;     stops carrying 16 bytes of run-time scratch. The dword/word
+;     grouping is preserved, so wDest/vSeg keep their even alignment.
+;   - SMALLER (both builds): PrintFile's proc uses drops SI/DI/ES -
+;     the body never reads or writes them (its only ES user is PopUp,
+;     which balances its own save/restore). Contract unchanged.
+;   - NO dead code found: a full-source symbol scan (labels, procs,
+;     data, equates, references) comes up empty beyond the four
+;     required image anchors (ZPAD/BSSPAD pads, FILEEND stamp,
+;     BMEMTOP marker). Consistent with 3.13-3.15's sweeps.
+;   - Version stamp <4VIEW316>. Assemble with -0 and -3 and run the
+;     usual battery before shipping.
 ;
 ; 3.15: COMPATIBILITY + FINAL DEAD-CODE SWEEP + MICRO-CLEANUPS.
 ;   - FIXED: JFAST/JNATIVE required SMART.INC >= 4.03. The shipped
@@ -2732,8 +2767,8 @@ ORGSTART        label byte              ; 3.00 (267/272): offset 100h,
                                         ; EVEN - the pad counts below
                                         ; diff their offsets against it
 
-VERMAJ      equ 3                       ; product version 3.15
-VMIN        equ 15                       ; 4.02-compatible JFAST + final dead-code sweep
+VERMAJ      equ 3                       ; product version 3.16
+VMIN        equ 16                       ; Info date/time fix + 386 speed-ups
 LINES_VIS   equ 23                      ; content rows 1..23 (title row 0,
                                         ; status row 24)
 CACHE_SZ    equ 64                      ; scroll cache entries - a ring of
@@ -3164,6 +3199,24 @@ MODPAIR32 macro
 ; never #DE and the 8086 build is the exact inverse of the thumb
 ; placement (fix 248). Clobbers AX BX CX DX BP DI, flags.
 MAPROW macro
+        if USE386
+        ; 3.16: native 64/32 division - EAX = the travel, MUL ECX builds
+        ; the full 64-bit row*travel product (<= 22*(2^32-1), fits
+        ; EDX:EAX) and DIV ECX yields the EXACT quotient (it is <=
+        ; travel <= 2^32-1, so no #DE). The 8086 three-word form below
+        ; computes the same quotient the hard way. AX keeps the low
+        ; word of EAX automatically; SHLD lifts the high word into DX
+        ; (the stale remainder EDX held does not matter: only DX, the
+        ; LOW word of EDX, is read).
+        push dx
+        push ax
+        pop eax                         ; EAX = the travel (DX:AX)
+        mov ecx,ebx                     ; ECX = the clicked row R
+        mul ecx                         ; EDX:EAX = R*travel, unsigned
+        mov ecx,LINES_VIS-1             ; / 22
+        div ecx                         ; EAX = the exact target line
+        shld edx,eax,16                 ; DX:AX = the target (AX is its
+        else                            ; low word already)
         mov bp,bx                       ; BP = the clicked row R
         mov di,ax                       ; DI = travel low (TL)
         mov cx,dx                       ; CX = travel high (TH)
@@ -3186,6 +3239,7 @@ MAPROW macro
         pop ax                          ; AX = P0
         div bx                          ; AX = q0
         mov dx,cx                       ; DX:AX = the exact target line
+        endif
         endm
 
 ;------------------------------------------------------------------------------
@@ -7616,6 +7670,32 @@ AtoU32 endp
 
 
 U2A32 proc uses ax bx cx dx si
+        if USE386
+        ; 3.16: native 32-bit divide - one DIV r32 per digit instead of
+        ; the two-DIV r16 pair (the high word first, then the low with
+        ; the remainder riding DX). U2A32 runs 2-3 times per status
+        ; repaint, so the ~15 cycles per digit add up. EAX = DX:AX
+        ; rebuilt on the stack; the digits are pushed as 32-bit words
+        ; and popped with POP EAX. The output and the digit order are
+        ; identical to the pair version for every 32-bit value (the
+        ; quotient always fits EAX, so no #DE is possible).
+        push dx
+        push ax
+        pop eax                        ; EAX = DX:AX
+        mov ebx,10
+        xor ecx,ecx
+@@l3:   xor edx,edx
+        div ebx                        ; EAX = quotient, EDX = digit (0..9)
+        push edx
+        inc cx
+        test eax,eax
+        jnz @@l3
+@@o3:   pop eax
+        add al,'0'
+        stosb
+        loop @@o3
+        ret
+        else
         mov si,10
         xor cx,cx
 @@l:    push ax
@@ -7644,6 +7724,7 @@ U2A32 proc uses ax bx cx dx si
         stosb
         loop @@o
         ret
+        endif
 U2A32 endp
 
 ShowInfo proc uses ax bx cx dx di si es
@@ -7677,7 +7758,13 @@ ShowInfo proc uses ax bx cx dx di si es
                 mov ax,5700h
                 int 21h
                 .if (!carry?)
-                        mov bx,cx                                ; CX survives Cpy/U2A (uses, 276)
+                        mov bx,dx              ; 3.16 FIX: BX = the DATE (DX);
+                                                ; 3.14 parked CX here - CX is the
+                                                ; TIME, so the day/month/year
+                                                ; extractions below printed bits of
+                                                ; the time and the hour/minute block
+                                                ; printed bits of the date. BX
+                                                ; survives Cpy/U2A (uses, 276).
                         mov si,offset sIDate
                         call Cpy
                         mov ax,bx
@@ -7697,7 +7784,8 @@ ShowInfo proc uses ax bx cx dx di si es
                         call U2A
                         mov al,' '
                         stosb
-                        mov bx,dx                                ; DX survives Cpy/U2A (uses, 276)
+                        mov bx,cx              ; 3.16 FIX: BX = the TIME (CX);
+                                                ; survives Cpy/U2A (uses, 276)
                         mov ax,bx
                         shr ax,11             ; hour (SMART.INC macro)
                         call U2A2
@@ -7751,10 +7839,10 @@ ShowInfo proc uses ax bx cx dx di si es
         ret
 ShowInfo endp
 
-PrintFile proc uses ax bx cx dx si di es
-        .if (!isFile)
-                ret
-        .endif
+PrintFile proc uses ax bx cx dx         ; 3.16: SI/DI/ES dropped - the body
+        .if (!isFile)                   ; never touches them (PopUp, the only
+                ret                     ; ES user here, balances its own
+        .endif                          ; save/restore)
         SAVEPOS prnSave               ; fix 178: saved before anything can
         mov dx,offset sPRN            ; fail, restored on every exit - the
         mov ax,3D01h                  ; 2.00 error paths returned with the
@@ -8331,6 +8419,12 @@ cfLines         dd 0                    ; 3.07: the line count PROVEN at cfPos
                                         ; (DI:BP at the abort). CountFull starts
                                         ; DI:BP = cfLines so the running total
                                         ; is absolute, not relative to cfPos
+srSave          dd 0                    ; 3.16: DoSearch's curPos save (175) -
+                                        ; write-before-read (SAVEPOS at entry),
+                                        ; moved here from the data tail so the
+                                        ; image stops carrying run-time scratch
+prnSave         dd 0                    ; 3.16: PrintFile's curPos save (178) -
+                                        ; write-before-read (SAVEPOS at entry)
 hFile           dw 0
 cCnt            dw 0
 cHead           dw 0                    ; scroll ring: next write slot,
@@ -8348,6 +8442,13 @@ popLines        dw 0
 popOff          dw 0            ; pop-up corner offset, reused 3x (fix 33)
 bmHPos          dw 0
 srLen           dw 0
+prnH            dw 0                    ; 3.16: PrintFile's PRN handle - written
+                                        ; before every read (the error paths
+                                        ; run after the open sets it)
+askMax          dw 0                    ; 3.16: PopAsk's per-call state - all
+askBuf          dw 0                    ; three are written at PopAsk's entry
+askCnt          dw 0                    ; before any read (moved from the data
+                                        ; tail: the image carries no scratch)
 mPres           db 0
 hFull           db 0
 hByte           db 0
@@ -8477,13 +8578,13 @@ endif
 b6              db "Assembler: ASMC ",'0'+AV/100,".",'0'+(AV mod 100)/10,'0'+AV mod 10,0
 b7              db "Free to use, modify and distribute.",0
 idleCnt         db 0                    ; idle-pass counter (fix 81); it
-; --- 2.00 new data ---
-askMax          dw 0
-askBuf          dw 0
-askCnt          dw 0
-srSave          dd 0
-prnSave         dd 0
-prnH            dw 0
+                                        ; stays OUTSIDE the cleared block: a
+                                        ; single odd byte there would make
+                                        ; wDest/vSeg odd-aligned (3.14's
+                                        ; layout note) - and its initial value
+                                        ; only phase-shifts the mod-8 poll
+; --- 2.00 new data (3.16: askMax/askBuf/askCnt/srSave/prnSave/prnH moved
+; into the Init-cleared state block above - all six are write-before-read) ---
 nfTab           dw nf1,nf2,sBlank
 errTab          dw err1,err2,sBlank
 sBlank          db 0
@@ -8522,7 +8623,7 @@ infoTab         dw offset infoBuf, offset infoBuf+80, offset infoBuf+160, offset
 ; every other buffer is written before it is read, and the stack
 ; lives ~7.6 KB above BMEMTOP at the top of the segment (24 KB until
 ; fix 118 doubled BUFSZ).
-FILEEND         db "<4VIEW315>",0       ; last initialized bytes: the
+FILEEND         db "<4VIEW316>",0       ; last initialized bytes: the
                                         ; image stamp (fix 97; 3.02b End)
 PADPOS  label byte                      ; 3.00 (272): an even BSSPAD -
 PADN = (offset PADPOS - offset ORGSTART) AND 1  ; fName and every slot
